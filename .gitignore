@@ -1,0 +1,30 @@
+# The directory Mix will write compiled artifacts to.
+/_build/
+
+# If you run "mix test --cover", coverage assets end up here.
+/cover/
+
+# The directory Mix downloads your dependencies sources to.
+/deps/
+
+# Where third-party dependencies like ExDoc output generated docs.
+/doc/
+
+# Temporary files, for example, from tests.
+/tmp/
+
+# If the VM crashes, it generates a dump, let's ignore it too.
+erl_crash.dump
+
+# Also ignore archive artifacts (built via "mix archive.build").
+*.ez
+
+# Ignore package tarball (built via "mix hex.build").
+forge_ops_tracker-*.tar
+
+# This is a library, not an app: Hex's own guidance is that a library's lock file should stay
+# uncommitted, since a consuming application resolves its own dependency versions and ignores
+# this one anyway (same "consumers resolve their own dependency versions" reasoning as every
+# other client in this repo's own .gitignore, e.g. gems/forge_ops_tracker's).
+/mix.lock
+
