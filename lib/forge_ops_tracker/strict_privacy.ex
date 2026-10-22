@@ -12,6 +12,11 @@ defmodule ForgeOpsTracker.StrictPrivacy do
 
   # Matched against the raw bytes (no /u), so a word character is ASCII [A-Za-z0-9_] only, never a
   # letter or digit in another script, whatever PCRE would otherwise consider one.
+  @email ~r/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/
+  # A quoted value (KeyError: 'Jane Doe') is data, not the shape of the error. A single quote only
+  # opens or closes one where no ASCII word character touches it, so "Couldn't" never does.
+  @double_quoted ~r/"[^"\r\n]*"/
+  @single_quoted ~r/(?<![A-Za-z0-9_])'[^'\r\n]*'(?![A-Za-z0-9_])/
   @hex_object_id ~r/0x[0-9a-fA-F]{4,}/
   @uuid ~r/(?<![A-Za-z0-9_])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![A-Za-z0-9_])/
   @number ~r/(?<![A-Za-z0-9_])[0-9]+(?![A-Za-z0-9_])/
@@ -25,13 +30,18 @@ defmodule ForgeOpsTracker.StrictPrivacy do
   @span_data_keys ["db.statement", "db.system"]
 
   @doc """
-  The message with hex object ids, UUIDs and standalone numbers replaced, in that order: `"0x"`
+  The message with emails, quoted values, hex object ids, UUIDs and standalone numbers replaced, in
+  that order: an email becomes `"<email>"`, a double or single quoted run becomes `"<str>"`, `"0x"`
   plus 4 or more hex digits becomes `"0x"`, a UUID becomes `"<uuid>"` and a run of digits becomes
-  `"<n>"`, the last two only where no ASCII word character touches them.
+  `"<n>"`. A single quote, a UUID and a number count only where no ASCII word character touches
+  them.
   """
   @spec normalize_message(String.t() | nil) :: String.t()
   def normalize_message(message) do
-    normalized = Regex.replace(@hex_object_id, to_string(message), "0x")
+    normalized = Regex.replace(@email, to_string(message), "<email>")
+    normalized = Regex.replace(@double_quoted, normalized, "<str>")
+    normalized = Regex.replace(@single_quoted, normalized, "<str>")
+    normalized = Regex.replace(@hex_object_id, normalized, "0x")
     normalized = Regex.replace(@uuid, normalized, "<uuid>")
     Regex.replace(@number, normalized, "<n>")
   end

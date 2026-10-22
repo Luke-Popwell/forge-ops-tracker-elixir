@@ -12,7 +12,7 @@ supervision and logging primitives rather than anything bolted on from outside.
 ```elixir
 def deps do
   [
-    {:forge_ops_tracker, "~> 0.18.1"}
+    {:forge_ops_tracker, "~> 0.19.0"}
   ]
 end
 ```
