@@ -48,6 +48,57 @@ defmodule ForgeOpsTracker.ConfigurationTest do
       assert not Configuration.enabled?(%{config | dsn: nil})
     end
 
+    test "resolve_environment: FORGE_OPS_ENVIRONMENT, app config, MIX_ENV, Mix.env, then production" do
+      all = %{"FORGE_OPS_ENVIRONMENT" => "staging", "MIX_ENV" => "dev"}
+      assert Configuration.resolve_environment(all, "qa", :test) == "staging"
+      assert Configuration.resolve_environment(%{"MIX_ENV" => "dev"}, "qa", :test) == "qa"
+      assert Configuration.resolve_environment(%{"MIX_ENV" => "dev"}, :qa, :test) == "qa"
+      assert Configuration.resolve_environment(%{"MIX_ENV" => "dev"}, nil, :test) == "development"
+      assert Configuration.resolve_environment(%{}, nil, :dev) == "development"
+      assert Configuration.resolve_environment(%{}, nil, nil) == "production"
+    end
+
+    test "resolve_environment maps MIX_ENV's and Mix.env's names, and passes any other value through" do
+      for {mix_env, expected} <- [
+            {"prod", "production"},
+            {"dev", "development"},
+            {"test", "test"},
+            {"staging", "staging"}
+          ] do
+        assert Configuration.resolve_environment(%{"MIX_ENV" => mix_env}, nil, nil) == expected
+
+        assert Configuration.resolve_environment(%{}, nil, String.to_atom(mix_env)) == expected
+      end
+    end
+
+    test "resolve_environment treats an empty or blank value as unset" do
+      env = %{"FORGE_OPS_ENVIRONMENT" => "", "MIX_ENV" => " "}
+      assert Configuration.resolve_environment(env, "", nil) == "production"
+    end
+
+    test "the struct's own default environment is production" do
+      assert %Configuration{}.environment == "production"
+    end
+
+    test "disabled_environment_warning names the environment and the enabled ones when a DSN is set" do
+      config = %Configuration{dsn: "https://key@host/api/v1/events", environment: "development"}
+
+      assert Configuration.disabled_environment_warning(config) ==
+               ~s([ForgeOps] Not sending: this environment is "development", and only production, ) <>
+                 ~s(staging are enabled. Set FORGE_OPS_ENVIRONMENT=production (or add "development" ) <>
+                 ~s(to the enabled environments\) to send from here.)
+    end
+
+    test "disabled_environment_warning is nil without a DSN, or when the environment is enabled" do
+      assert Configuration.disabled_environment_warning(%Configuration{
+               environment: "development"
+             }) ==
+               nil
+
+      config = %Configuration{dsn: "https://key@host/api/v1/events", environment: "staging"}
+      assert Configuration.disabled_environment_warning(config) == nil
+    end
+
     test "log calls the configured logger" do
       test_pid = self()
       config = %Configuration{logger: fn message -> send(test_pid, {:logged, message}) end}

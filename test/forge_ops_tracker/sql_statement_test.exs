@@ -35,6 +35,57 @@ defmodule ForgeOpsTracker.SqlStatementTest do
     end
   end
 
+  # The server's canonical masking cases ({statement, db.system, expected}), copied in whole so
+  # every SDK's port is checked against exactly the same set.
+  @corpus [
+    {"SELECT * FROM orders WHERE email = 'a@b.co' AND id = 42 LIMIT 10", nil,
+     "SELECT * FROM orders WHERE email = ? AND id = ? LIMIT ?"},
+    {"EXEC sp_note @text = 'it''s broken'", nil, "EXEC sp_note @text = ?"},
+    {"SELECT 1 WHERE name = 'unterminated", nil, "SELECT ? WHERE name = ?"},
+    {"DO $body$ BEGIN PERFORM 1; END $body$", nil, "DO ?"},
+    {"SELECT \"user id\" FROM orders2 WHERE id = $1 AND v = sp_v2(?)", nil,
+     "SELECT \"user id\" FROM orders2 WHERE id = $1 AND v = sp_v2(?)"},
+    {"SELECT price * 1.5 FROM t", nil, "SELECT price * ? FROM t"},
+    {"SELECT * FROM users WHERE name = E'o\\'brien' AND id = 1", nil,
+     "SELECT * FROM users WHERE name = ? AND id = ?"},
+    {"SELECT * FROM users WHERE name = 'o\\'brien' AND id = 1", nil,
+     "SELECT * FROM users WHERE name = ? AND id = ?"},
+    {"SELECT * FROM t WHERE b = X'DEADBEEF' AND s = N'uni' AND u = U&'d\\0061t' AND e = e'x'",
+     nil, "SELECT * FROM t WHERE b = ? AND s = ? AND u = ? AND e = ?"},
+    {"SELECT * FROM t WHERE a LIKE'%secret%'", nil, "SELECT * FROM t WHERE a LIKE?"},
+    {"SELECT * FROM t WHERE f = 0x1F AND b = 0b101 AND n = 3e10 AND m = 1.5E-3 AND k = .5", nil,
+     "SELECT * FROM t WHERE f = ? AND b = ? AND n = ? AND m = ? AND k = ?"},
+    {"SELECT e, t.col, 1e5e FROM t", nil, "SELECT e, t.col, 1e5e FROM t"},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", "mysql",
+     "SELECT ? FROM t WHERE token = ?"},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", "MariaDB",
+     "SELECT ? FROM t WHERE token = ?"},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", "postgresql",
+     "SELECT \"user id\" FROM t WHERE token = \"abc123secret\""},
+    {"SELECT \"user id\" FROM t WHERE token = \"abc123secret\"", nil,
+     "SELECT \"user id\" FROM t WHERE token = \"abc123secret\""},
+    {"SELECT * FROM t WHERE a = 'x' AND b = 9", nil, "SELECT * FROM t WHERE a = ? AND b = ?"},
+    {"SELECT * FROM t WHERE a = ? AND b = ?", nil, "SELECT * FROM t WHERE a = ? AND b = ?"},
+    {"SELECT * FROM t WHERE path = 'C:\\\\dir\\\\' AND n = 5", nil,
+     "SELECT * FROM t WHERE path = ? AND n = ?"},
+    {"INSERT INTO t (a, b) VALUES (-5, +3.25e+2)", nil, "INSERT INTO t (a, b) VALUES (-?, +?)"},
+    {"SELECT * FROM t WHERE a = 'secret\\", nil, "SELECT * FROM t WHERE a = ?"},
+    {"SELECT * FROM t WHERE a = \"secret\\", "mysql", "SELECT * FROM t WHERE a = ?"}
+  ]
+
+  describe "mask/2 against the server's cases" do
+    for {{statement, system, expected}, index} <- Enum.with_index(@corpus) do
+      @statement statement
+      @system system
+      @expected expected
+
+      test "case #{index}: #{statement}" do
+        assert SqlStatement.mask(@statement, system: @system) == @expected
+        assert SqlStatement.mask(@expected, system: @system) == @expected
+      end
+    end
+  end
+
   describe "mask/1" do
     test "replaces strings and numbers, leaving identifiers and placeholders" do
       assert SqlStatement.mask(

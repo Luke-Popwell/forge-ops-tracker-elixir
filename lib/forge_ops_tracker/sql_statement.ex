@@ -16,7 +16,26 @@ defmodule ForgeOpsTracker.SqlStatement do
   @max_names 10
   @max_name_length 200
 
-  @literal ~r/'(?:[^']|'')*(?:'|\z)|(?<tag>\$[A-Za-z_]*\$).*?(?:\k<tag>|\z)|(?<![\w$.])\d+(?:\.\d+)?(?!\w)/s
+  # db.system values where "double quotes" are a string, not a name.
+  @double_quoted_string_systems ~w(mysql mariadb)
+
+  # The prefix only counts as one when it isn't the end of a word, but the quote always does:
+  # LIKE'%x%', with no space, is still a string. A backslash can be the statement's last character
+  # ('secret\ cut off mid-escape), and the string is still masked to the end.
+  @string ~S{(?:(?<![\w$])(?:[EeXxNnBb]|[Uu]&))?'(?:[^'\\]|\\(?:.|\z)|'')*(?:'|\z)}
+  @double_quoted_string ~S{"(?:[^"\\]|\\(?:.|\z)|"")*(?:"|\z)}
+  @dollar_quoted ~S{(?<tag>\$[A-Za-z_]*\$).*?(?:\k<tag>|\z)}
+  # [0-9A-Fa-f] where the Ruby original has \h: in PCRE, \h is horizontal whitespace.
+  @number ~S{(?<![\w$.])(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)(?!\w)}
+
+  @literal Regex.compile!(Enum.join([@string, @dollar_quoted, @number], "|"), "s")
+  @literal_with_double_quotes Regex.compile!(
+                                Enum.join(
+                                  [@string, @double_quoted_string, @dollar_quoted, @number],
+                                  "|"
+                                ),
+                                "s"
+                              )
 
   @part ~S{(?:[\w$#@]+|"[^"]+"|\[[^\]]+\]|`[^`]+`)}
   @name @part <> ~S{(?:\.} <> @part <> ")*"
@@ -64,12 +83,19 @@ defmodule ForgeOpsTracker.SqlStatement do
 
   defp statement_from(_other), do: nil
 
-  @spec mask(String.t() | nil) :: String.t() | nil
-  def mask(statement) when is_binary(statement) do
+  @doc """
+  `statement` with every string and number replaced by `?`, or `nil` when it's blank. Pass the
+  query's db.system as `system:` when it's known: on `"mysql"` and `"mariadb"`, "double quotes"
+  are a string too, so they're masked there and left alone everywhere else.
+  """
+  @spec mask(String.t() | nil, keyword()) :: String.t() | nil
+  def mask(statement, opts \\ [])
+
+  def mask(statement, opts) when is_binary(statement) do
     if String.trim(statement) == "" do
       nil
     else
-      masked = Regex.replace(@literal, statement, @mask)
+      masked = Regex.replace(pattern(Keyword.get(opts, :system)), statement, @mask)
 
       if String.length(masked) > @max_length,
         do: String.slice(masked, 0, @max_length) <> "...",
@@ -77,7 +103,15 @@ defmodule ForgeOpsTracker.SqlStatement do
     end
   end
 
-  def mask(_statement), do: nil
+  def mask(_statement, _opts), do: nil
+
+  defp pattern(system) when is_binary(system) do
+    if String.downcase(system) in @double_quoted_string_systems,
+      do: @literal_with_double_quotes,
+      else: @literal
+  end
+
+  defp pattern(_system), do: @literal
 
   @doc """
   Takes an already-masked statement (so a keyword inside a string value can't be mistaken for

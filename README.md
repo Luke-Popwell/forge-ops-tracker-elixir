@@ -5,12 +5,14 @@ Requires Elixir 1.18+ and an OTP install with `:inets`/`:ssl` (bundled with ever
 install). Reports exceptions and process crashes anywhere in the BEAM VM, using OTP's own
 supervision and logging primitives rather than anything bolted on from outside.
 
+> For health or personal data, turn on [strict privacy](#strict-privacy): the SDK then sends only structured facts about each error (its type, stack trace, release and route), never the message, a raw path, breadcrumbs, or context you haven't allowed.
+
 ## Installation
 
 ```elixir
 def deps do
   [
-    {:forge_ops_tracker, "~> 0.10.0"}
+    {:forge_ops_tracker, "~> 0.18.1"}
   ]
 end
 ```
@@ -23,20 +25,40 @@ variable, `config.exs`, or an explicit `init/1` call:
 ```elixir
 # config/config.exs
 config :forge_ops_tracker,
-  dsn: "https://<api_key>@getforgeops.net/api/v1/events",
-  environment: "production"
+  dsn: "https://<api_key>@getforgeops.net/api/v1/events"
 ```
 
 ```elixir
 # or, at application startup (application.ex's own start/2, before the rest of your
 # supervision tree starts, is the natural place):
-ForgeOpsTracker.init(dsn: "...", environment: "production")
+ForgeOpsTracker.init(dsn: "...")
 ForgeOpsTracker.install_handlers()
 ```
 
 `init/1` accepts the same keys as `ForgeOpsTracker.Configuration`'s struct fields and raises
 `ArgumentError` for an unknown one, so a typo in a config key fails loudly at startup instead of
 silently being ignored.
+
+### Environments
+
+Errors are only sent from the environments in `enabled_environments` (default `production` and
+`staging`). The current environment is the first of these that's set:
+
+1. `FORGE_OPS_ENVIRONMENT`
+2. `config :forge_ops_tracker, environment: "..."` (or `init(environment: "...")`)
+3. `MIX_ENV`, read as `"production"` for `prod`, `"development"` for `dev` and `"test"` for `test`
+4. `Mix.env()`, read the same way, when the app is running under Mix (`mix run`, `iex -S mix`,
+   `mix phx.server`, `mix test`)
+5. `"production"`
+
+So under Mix, `iex -S mix` or `mix phx.server` reports as `"development"` and sends nothing, the
+same as before, while a Mix release, an escript or an `elixir` script (where Mix isn't running) with
+nothing but a DSN reports as `"production"` and sends. To send a test error from your development
+machine, run it with `FORGE_OPS_ENVIRONMENT=production`.
+
+When a DSN is set but the environment isn't enabled, `init/1` logs one warning saying so, and
+nothing is sent. To send from that environment too, add it:
+`init(enabled_environments: MapSet.new(["production", "staging", "development"]))`.
 
 ## What gets reported automatically, and what doesn't
 
@@ -74,6 +96,18 @@ and the actual HTTP call for each delivery runs in its own short-lived `Task` ra
 in the `GenServer`'s own callback, so a slow or unreachable tracker never makes the queue itself
 unresponsive to new pushes. Every failure mode (network errors, timeouts, a malformed DSN) is
 caught and logged rather than propagated, so a broken tracker can never take down the host app.
+
+An error reported just before the VM stops isn't lost. A `mix run` or `elixir` script, or an
+escript, waits when it finishes for whatever is still queued to go out, and a VM stopped normally
+(`System.stop/0`, a release shutting down, `Application.stop/1`) sends it from the queue's
+`terminate/2`. Either way the wait is at most 5 seconds, and a VM that never reported anything
+doesn't wait at all. If your program can end another way (`System.halt/1`), or you want delivery
+done before moving on, call `ForgeOpsTracker.flush/1` yourself:
+
+```elixir
+ForgeOpsTracker.capture_exception(error, __STACKTRACE__)
+ForgeOpsTracker.flush(2_000)  # milliseconds; returns :ok or {:error, :timeout}
+```
 
 ## Identifying users
 
@@ -206,6 +240,48 @@ To disable it:
 ForgeOpsTracker.init(scrub_pii: false)
 ```
 
+## Strict privacy
+
+For apps that can't let personal or health data (PII, PHI) leave their own servers. With strict
+privacy on, an error is sent as structured facts only, never free text a person could have typed:
+
+- no message: a `message_fingerprint` is sent instead, a one-way hash of the message (as PII
+  scrubbing leaves it) with its numbers, hex ids and UUIDs taken out, computed in this VM, so
+  errors still group by message;
+- no breadcrumbs (`add_breadcrumb/4` records nothing), no `endpoint`, no SQL statement
+  (`sql_objects`, the table and procedure names, still go), and no source context;
+- the user's `id` only, never an email or username;
+- `context` and `tags` keep only the keys you list in `privacy_allowed_fields`, and only when the
+  value is a string, number or boolean. Atom keys match too (`%{error_code: "E42"}` is kept when
+  `"error_code"` is allowed).
+
+Spans are reduced too: an outbound HTTP span is named by method and host alone
+(`GET api.example.com`), and span data keeps only `db.statement` (already masked) and `db.system`. A
+raw path (one with no route parameter like `:id` or `{id}` in it) keeps only its first segment, then
+`/:path` if there was more, since anything after it can name a person: `/patients/jane-doe/12` is
+sent as `/patients/:path`, `/42/edit` as `/:id/:path`. A route template (`/patients/:id/notes`) is
+sent as it is, so reporting routes rather than raw paths loses nothing. That applies to span names
+and to the transaction name in error events and performance samples; the Phoenix integration already
+reports route templates, and a worker name is kept as it is. The exception class, stack frames,
+release, environment, server and trace id are unchanged, as are metrics, query plans and change
+snapshots. A failed Oban job is reported like any other error, so its `job` context key is only sent
+when you allow it.
+
+```elixir
+# config/config.exs
+config :forge_ops_tracker,
+  strict_privacy: true,
+  privacy_allowed_fields: ["error_code", "feature"]
+```
+
+or `ForgeOpsTracker.init(strict_privacy: true, privacy_allowed_fields: ["error_code"])`. Both are
+off and empty by default, and can be set from the environment instead:
+`FORGE_OPS_STRICT_PRIVACY=true` and `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature` (comma
+separated). A value set in `config.exs` or `init/1` wins over the environment.
+
+ForgeOps applies the same rules again on arrival when the project's own Strict privacy setting is
+on, so an app with an older or misconfigured client still can't get text stored for that project.
+
 ## Performance monitoring
 
 Times requests, database queries, and background jobs, each its own `kind`
@@ -251,7 +327,7 @@ ForgeOpsTracker.init(
 ```
 
 Requires a ForgeOps plan that includes performance monitoring; on a plan that doesn't, the periodic
-reports are simply rejected server-side and dropped, exactly like any other delivery failure.
+reports are accepted but not recorded, and the response says why.
 
 Requires the optional `:telemetry` dependency (see Dependencies below); a host app using Phoenix,
 Ecto, or Oban already carries it transitively, since all three depend on it themselves.
@@ -262,13 +338,15 @@ A slow request's or job's own breakdown: which database queries or pieces of you
 went to, shown as a span tree on ForgeOps. On by default once the integrations above are attached,
 no extra setup: `ForgeOpsTracker.Integrations.Phoenix` opens a trace per request (root span named
 like the transaction), `Oban` one per job (`kind: "job"`), and `Ecto` adds a `"database"` span per
-query into whichever trace the calling process has open, named `"SELECT users"`, never the SQL. A
-trace is sent to `/spans` only when its root took at least `trace_capture_threshold` milliseconds
-(1000 by default), so fast requests cost nothing on the wire. Traces are per service; nothing is
-propagated across services.
+query into whichever trace the calling process has open, named `"SELECT users"` and carrying the
+masked SQL (see [SQL on database spans](#sql-on-database-spans)). A
+trace is sent to `/spans` when its root took at least `trace_capture_threshold` milliseconds (1000
+by default) or when an error was captured during it, so fast, successful requests cost nothing on
+the wire.
 
 Outbound HTTP is not instrumented automatically (every HTTP client library has its own telemetry
-events), so wrap a call by hand, alongside anything else you want to see:
+events), so wrap a call by hand (for HTTP, prefer `http_span/4`, below), alongside anything else
+you want to see:
 
 ```elixir
 order = ForgeOpsTracker.span("charge card", "service", %{order_id: id}, fn -> charge(id) end)
@@ -283,8 +361,144 @@ ForgeOpsTracker.record_span("SELECT orders", "database", started_at, duration_ms
 raises (the error propagates unchanged), and just runs the function outside a trace. Like
 breadcrumbs and `set_user/1`, the trace lives in the process dictionary, so it follows the one
 process Phoenix and Oban run the work in, not a `Task` you spawn from it. To trace something else,
-such as a GenServer message, call `ForgeOpsTracker.start_trace/0` and `finish_trace/4` yourself. A
-trace holds at most 500 spans. Turn the feature off with `track_tracing: false`.
+such as a GenServer message, call `ForgeOpsTracker.start_trace/1` and `finish_trace/4` yourself. A
+trace holds at most 500 spans. Turn span reporting off with `track_tracing: false`.
+
+### SQL on database spans
+
+Every database span the Ecto integration records carries the query's SQL as `db.statement`, with
+every string and number replaced by `?`, plus `db.system` (`postgresql`, `mysql`, `sqlite`, and so
+on, from the repo's adapter). Query params are never sent. That includes escaped and prefixed
+strings (`E'o\'brien'`, `X'DEADBEEF'`), hex, binary and exponent numbers (`0x1F`, `0b101`,
+`1.5E-3`), and, on MySQL and MariaDB (where `"double quotes"` hold a string, not a name),
+double-quoted strings. So a slow request's waterfall shows which query was slow, not only which
+table:
+
+```
+SELECT u0."id", u0."total" FROM "orders" AS u0 WHERE (u0."customer_id" = $1) AND (u0."status" = ?)
+```
+
+A query you time yourself (a driver this client doesn't instrument, or `Postgrex` directly) can
+carry its SQL too. Pass `:statement` (and optionally `:db_system`) to `span/5` or `record_span/6`
+for a `"database"` span; it's masked the same way:
+
+```elixir
+sql = "SELECT id, total FROM orders WHERE customer_id = $1 AND status = 'paid'"
+
+rows =
+  ForgeOpsTracker.span("Load orders", "database", %{}, [statement: sql, db_system: "postgresql"], fn ->
+    Postgrex.query!(MyApp.Postgrex, sql, [customer_id]).rows
+  end)
+
+# The span's data: %{"db.statement" => "SELECT id, total FROM orders WHERE customer_id = $1 AND status = ?",
+#                    "db.system" => "postgresql"}
+```
+
+### Query plans for slow PostgreSQL queries (opt-in)
+
+With `explain_slow_queries: true`, a slow read on a PostgreSQL repo also gets its query plan, so
+ForgeOps can show why it was slow (a sequential scan, a missing index) next to the query:
+
+```elixir
+ForgeOpsTracker.init(
+  explain_slow_queries: true,  # default false
+  explain_threshold_ms: 500    # milliseconds; default 500
+)
+```
+
+What it does:
+
+- Only for a query that took at least `explain_threshold_ms`, through a repo attached with
+  `ForgeOpsTracker.Integrations.Ecto.attach/1` whose adapter is `Ecto.Adapters.Postgres`.
+- Only for a single plain `SELECT`: never a write, a statement with a second statement after it, a
+  `SELECT ... FOR UPDATE`/`FOR SHARE`, or a `WITH` query that modifies data.
+- Runs `EXPLAIN (FORMAT JSON)`, never `EXPLAIN ANALYZE`, so the query itself is not run again. It
+  runs later, in a `Task` started by the client's own supervised planner process (not by your
+  process, so it never shares your connection or transaction), on a connection checked out of the
+  repo's pool, inside a `READ ONLY` transaction with a 2 second `statement_timeout` that is always
+  rolled back.
+- At most once per distinct query every 10 minutes, at most 10 per minute, and one at a time.
+- Sends the masked statement and the plan with every string in it masked the same way (a plan's
+  `Filter` repeats the query's values). Your params are used for the `EXPLAIN` and then dropped;
+  they are never sent. A plan over 64 KB is dropped.
+
+What it doesn't do: it doesn't run for MySQL, SQLite, or any other adapter. It briefly uses one
+connection from your pool while it runs, so if the pool is exhausted it waits for one like any
+other checkout and gives up on a timeout. Any failure (a timeout, a permission error, no free
+connection) is logged through your `logger` and skipped; it never raises into your app. The
+database user needs no extra privileges beyond being able to run the query. Plans are stored only
+for projects with performance monitoring; otherwise ForgeOps quietly declines them.
+
+### Following a request across services
+
+Traces use the [W3C Trace Context](https://www.w3.org/TR/trace-context/) standard (a `traceparent`
+header), so an error or a slow call can be followed from one service into the next.
+
+**Incoming**: automatic with the Phoenix integration. A request that arrives with a valid
+`traceparent` header continues that trace (same trace id), and its root span records the caller's
+span as its parent. A missing or malformed header just starts a new trace.
+
+**Outgoing**: wrap each HTTP call you make during a request in `http_span/4`. It records the call
+as an `"http"` span named after the method and host (never the path or query) and hands your
+function the headers to add, a list of `{name, value}` tuples; the header's parent id is that span's
+own id, so the called service's spans nest under it. It works with any HTTP client, records the
+span even when the call raises (the error propagates unchanged), and returns what your function
+returned:
+
+```elixir
+response =
+  ForgeOpsTracker.http_span("POST", url, fn headers ->
+    Req.post!(url, json: order, headers: headers)
+  end)
+
+# An optional data map comes before the function, like span/4's:
+ForgeOpsTracker.http_span(:get, url, %{attempt: 2}, fn headers ->
+  :get |> Finch.build(url, headers) |> Finch.request(MyFinch)
+end)
+```
+
+Outside a trace your function gets `[]` and nothing is recorded, so the same code works anywhere.
+`ForgeOpsTracker.current_trace_id/0` returns the calling process's trace id, for your own logs. To
+continue a trace in work that isn't a request (a job carrying the header it was enqueued with,
+say), pass that header to `ForgeOpsTracker.start_trace/1`.
+
+A trace id exists for every request even with `track_tracing: false`, and the header is still
+sent, since the trace id is also what links an error here to an error in the service you called
+(see [Where an error happened](#where-an-error-happened)); only span reporting stops. The service on
+the other end must also report to ForgeOps, and both projects must be linked in ForgeOps to see
+their errors and traces connected.
+
+Narrow or turn off where the header goes, for example if a third-party API rejects unknown headers:
+
+```elixir
+ForgeOpsTracker.init(
+  dsn: "...",
+  # never send traceparent (default true)
+  propagate_traces: false,
+  # Default nil: every host. A string matches that host and its subdomains on a dot boundary
+  # ("internal.example" matches "orders.internal.example", not "notinternal.example"); a Regex is
+  # matched against the host.
+  trace_propagation_targets: ["internal.example", ~r/\A10\.0\./]
+)
+```
+
+### Where an error happened
+
+An error reported during a Phoenix request (a crash, or your own `capture_exception/4` from inside
+the controller) carries three extra fields:
+
+- `transaction_name`: the same name performance monitoring and traces use, `"GET /users/:id"`.
+- `endpoint`: the HTTP method and the route as declared in your router, `"GET /users/:id"`. Never
+  the literal path, so an id or a token in the URL never ends up here.
+- `trace_id`: the request's W3C trace id, which ForgeOps uses to link this error to errors that
+  other services reported for the same trace.
+
+They're set as soon as the router has matched the route, before your pipeline and controller run.
+An error captured inside an Oban job, or inside your own `start_trace/1`, carries `trace_id` only.
+They're left out entirely outside a trace, and they're never PII-scrubbed: they're structured
+fields, not free text. A request that crashes keeps them even though the crash is only reported
+after Phoenix's router has finished with the request: the integration remembers them for that
+exception on its way out.
 
 ## Custom metrics and infrastructure monitoring
 
@@ -308,12 +522,54 @@ exit another way (`System.halt/1`). Every entry is stored as it was captured (a 
 running total), so a count or sum you compute later is exact. Both are a no-op when the client isn't
 enabled for the environment.
 
-A failed delivery keeps every entry for the next flush, and an entry captured while a delivery is in
-flight simply waits in the server's mailbox and is handled right after, so nothing is lost. The buffer
-holds at most 1000 entries per kind and drops further ones until a flush succeeds, since a plan without
-the feature rejects every flush and would otherwise grow it for as long as the node lives. A
-non-numeric value is dropped at capture. Requires a ForgeOps plan that includes custom metrics /
+A delivery that fails for now (a network error, a timeout, a 5xx, a 408 or a 429) keeps every entry
+for the next flush, and an entry captured while a delivery is in flight simply waits in the server's
+mailbox and is handled right after, so nothing is lost. A batch the server rejects (any other 4xx,
+such as the 403 a plan without the feature answers) is dropped rather than sent again, and so is one
+that has failed 5 flushes in a row. The buffer holds at most 1000 entries per kind and drops further
+ones until a flush lets go of them. A non-numeric value is dropped at capture. Requires a ForgeOps plan that includes custom metrics /
 infrastructure monitoring.
+
+## Recording changes
+
+Tell ForgeOps when something changes, so it shows up next to the errors that followed:
+
+```elixir
+ForgeOpsTracker.record_change(:feature_flag, "Enabled new checkout",
+  details: %{flag: "new_checkout", rollout: 25},
+  actor: "alice@example.com"
+)
+
+ForgeOpsTracker.record_change(:migration, "Add index on orders.user_id",
+  url: "https://github.com/acme/shop/pull/412",
+  id: "20260925120000"   # optional idempotency key
+)
+```
+
+`kind` is one of `:feature_flag`, `:config`, `:migration`, `:dependency`, `:infrastructure`,
+`:other` (anything else is sent as `"other"`). Other options: `:environment` (defaults to the
+configured one), `:service`, `:occurred_at` (a `DateTime`, defaults to now). Like error reports,
+it's queued and delivered in the background, never raises, and does nothing when the client isn't
+enabled.
+
+The client also sends one snapshot per VM at startup: the runtime and every loaded OTP application
+with its version. ForgeOps compares it with the previous one for the same environment and records
+what changed, so a dependency upgrade shows up without any call from you. It's sent from its own
+`Task`, so it never delays or breaks startup.
+
+```elixir
+ForgeOpsTracker.init(
+  dsn: "...",
+  environment: "production",
+  detect_changes: true,        # default true; false sends no snapshot
+  track_env_var_names: true    # default false; adds variable names (never values)
+)
+```
+
+With `track_env_var_names` on, host-specific names (`HOSTNAME`, `PATH`, `HOME`, `LC_*`,
+`KUBERNETES_*`, service discovery variables, `FORGE_OPS_*` and similar) are left out so a fleet of
+identical nodes doesn't look like it's changing. Requires a ForgeOps plan that includes change
+tracking; on other plans both are dropped silently.
 
 ## Dependencies
 

@@ -61,14 +61,16 @@ defmodule ForgeOpsTracker.Integrations.Oban do
     record_duration(measurements, metadata)
   end
 
+  # Captured before the trace is finished, so the report carries the job's trace id and the
+  # trace is sent however fast the job was.
   def handle_event([:oban, :job, :exception], measurements, metadata, _config) do
-    record_duration(measurements, metadata)
-
     if metadata.state == :discard do
       ForgeOpsTracker.capture_exception(metadata.reason, metadata.stacktrace || [], %{
         job: metadata.job.worker
       })
     end
+
+    record_duration(measurements, metadata)
   end
 
   defp record_duration(measurements, metadata) do

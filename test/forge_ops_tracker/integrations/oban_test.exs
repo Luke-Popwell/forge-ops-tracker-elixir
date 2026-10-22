@@ -9,6 +9,12 @@ defmodule ForgeOpsTracker.Integrations.ObanTest do
   alias ForgeOpsTracker.Integrations.Oban, as: ObanIntegration
 
   setup do
+    # Start from empty buckets: PerformanceFlusher is shared by every test module, and the ones
+    # that drive an integration for another purpose (TracingTest, TraceContextTest) leave their
+    # timings in it, some under the very keys asserted on here. Which module ran last depends
+    # on the seed, so cleaning up only after each test here was never enough.
+    :sys.replace_state(ForgeOpsTracker.PerformanceFlusher, &%{&1 | buckets: %{}})
+
     on_exit(fn ->
       Configuration.update(fn _ -> %Configuration{} end)
       :sys.replace_state(ForgeOpsTracker.PerformanceFlusher, &%{&1 | buckets: %{}})
@@ -73,7 +79,8 @@ defmodule ForgeOpsTracker.Integrations.ObanTest do
     ObanIntegration.handle_event([:oban, :job, :start], %{}, metadata, nil)
     ObanIntegration.handle_event([:oban, :job, :exception], measurements(4), metadata, nil)
 
-    [request] = wait_for_requests(requests, 1)
+    # The error's own report, not the spans request for its trace, which can arrive first.
+    request = wait_for_event_request(requests)
     body = JSON.decode!(request.body)
 
     assert Enum.any?(
@@ -136,6 +143,23 @@ defmodule ForgeOpsTracker.Integrations.ObanTest do
     body = JSON.decode!(request.body)
     assert body["message"] == "card declined"
     assert body["context"]["job"] == "MyApp.Workers.ChargeCard"
+  end
+
+  defp wait_for_event_request(requests, deadline \\ System.monotonic_time(:millisecond) + 2_000) do
+    case Enum.find(
+           Agent.get(requests, & &1),
+           &String.contains?(&1.request_line, "/api/v1/events ")
+         ) do
+      nil ->
+        if System.monotonic_time(:millisecond) > deadline,
+          do: flunk("timed out waiting for the event request")
+
+        Process.sleep(10)
+        wait_for_event_request(requests, deadline)
+
+      request ->
+        request
+    end
   end
 
   defp wait_for_requests(requests, count, deadline \\ System.monotonic_time(:millisecond) + 2_000) do

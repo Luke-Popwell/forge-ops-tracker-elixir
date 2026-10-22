@@ -4,7 +4,7 @@ defmodule ForgeOpsTracker.MixProject do
   def project do
     [
       app: :forge_ops_tracker,
-      version: "0.10.1",
+      version: "0.18.1",
       # The JSON module (used by ForgeOpsTracker.EventBuilder/Client) is part of Elixir's own
       # standard library only since 1.18: see README.md's "Dependencies" section for why that's
       # this SDK's one real floor, not an arbitrary pin.
@@ -40,7 +40,7 @@ defmodule ForgeOpsTracker.MixProject do
         "GitHub" => "https://github.com/Luke-Popwell/forge-ops-tracker-elixir",
         "Homepage" => "https://getforgeops.net"
       },
-      files: ~w(lib mix.exs README.md LICENSE.txt)
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE.txt)
     ]
   end
 

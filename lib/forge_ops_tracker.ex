@@ -13,9 +13,13 @@ defmodule ForgeOpsTracker do
 
   alias ForgeOpsTracker.{
     BreadcrumbBuffer,
+    Changes,
     Configuration,
+    DeliveryQueue,
     MetricBuffer,
     PerformanceFlusher,
+    QueryPlanner,
+    QueryPlans,
     Reporter,
     Tracing
   }
@@ -33,18 +37,26 @@ defmodule ForgeOpsTracker do
   Fields not passed here fall back to `Application.get_env(:forge_ops_tracker, key)` /
   `FORGE_OPS_DSN`-style environment variables read when this app started: see
   `ForgeOpsTracker.Configuration`'s own module doc.
+
+  Once the client is enabled, this also sends a change snapshot (once per VM, from its own `Task`,
+  so it never delays startup): see `record_change/3` and the `detect_changes` option.
   """
   @spec init(keyword()) :: Configuration.t()
   def init(opts \\ []) do
-    Configuration.update(fn config ->
-      Enum.reduce(opts, config, fn {key, value}, acc ->
-        if Map.has_key?(acc, key) do
-          Map.put(acc, key, value)
-        else
-          raise ArgumentError, "Configuration has no field #{inspect(key)}"
-        end
+    config =
+      Configuration.update(fn config ->
+        Enum.reduce(opts, config, fn {key, value}, acc ->
+          if Map.has_key?(acc, key) do
+            Map.put(acc, key, value)
+          else
+            raise ArgumentError, "Configuration has no field #{inspect(key)}"
+          end
+        end)
       end)
-    end)
+
+    Configuration.warn_if_not_sending(config)
+    Changes.maybe_send_snapshot()
+    config
   end
 
   @doc """
@@ -86,11 +98,24 @@ defmodule ForgeOpsTracker do
   nothing did); pass one explicitly to override that for this one report. The calling process's
   own breadcrumb trail (see `add_breadcrumb/4`) is always attached automatically, the same way
   `user` already is, with no separate argument for it.
+
+  Inside a trace (a Phoenix request, an Oban job, or your own `start_trace/1`), the event also
+  carries the trace's `trace_id`, plus the request's `transaction_name` and `endpoint` under
+  Phoenix, and the trace is marked errored so it's sent however fast it was.
   """
   @spec capture_exception(term(), Exception.stacktrace(), map(), map() | nil) :: :ok
   def capture_exception(reason, stacktrace, context \\ %{}, user \\ :from_process) do
     user = if user == :from_process, do: current_user(), else: user
-    Reporter.report(reason, stacktrace, context, user, BreadcrumbBuffer.all())
+    Tracing.mark_errored()
+
+    Reporter.report(
+      reason,
+      stacktrace,
+      context,
+      user,
+      BreadcrumbBuffer.all(),
+      Tracing.error_fields(reason)
+    )
   end
 
   @doc """
@@ -124,7 +149,7 @@ defmodule ForgeOpsTracker do
   Records one entry into the calling process's own breadcrumb trail: a query, an outbound call,
   or anything worth remembering right up to the moment something actually goes wrong. `category`
   defaults to `"custom"` and `level` to `"info"`. A no-op, not a raise, when
-  `Configuration.t/0`'s own `track_breadcrumbs` is `false`.
+  `Configuration.t/0`'s own `track_breadcrumbs` is `false` or `strict_privacy` is `true`.
 
   Stored in the process dictionary, the same isolation boundary `set_user/1` already uses and for
   the identical reason: a Phoenix request's own connection process, a GenServer, an Oban job all
@@ -134,7 +159,8 @@ defmodule ForgeOpsTracker do
   def add_breadcrumb(message, category \\ "custom", level \\ "info", data \\ %{}) do
     config = Configuration.get()
 
-    if config.track_breadcrumbs do
+    # Strict privacy never sends breadcrumbs, so none are recorded either.
+    if config.track_breadcrumbs and not config.strict_privacy do
       BreadcrumbBuffer.add(message, category, level, data, config.max_breadcrumbs)
     end
 
@@ -175,6 +201,12 @@ defmodule ForgeOpsTracker do
     config = Configuration.get()
 
     if config.track_performance and Configuration.enabled?(config) do
+      # Under strict privacy a raw path keeps only its first segment before it's ever a sample's name.
+      transaction_name =
+        if config.strict_privacy,
+          do: ForgeOpsTracker.StrictPrivacy.transaction_name(transaction_name),
+          else: transaction_name
+
       PerformanceFlusher.record(transaction_name, kind, duration_ms)
     end
 
@@ -236,15 +268,73 @@ defmodule ForgeOpsTracker do
   end
 
   @doc """
+  Waits until every error, change and trace queued so far has been sent, for at most `timeout`
+  milliseconds (default 5000). Returns `:ok`, or `{:error, :timeout}` if something was still
+  waiting when the time ran out.
+
+  A `mix run` or `elixir` script, an escript, and a VM stopped normally already do this on their
+  own, so this is for anything that ends another way (`System.halt/1`, `:erlang.halt/0`), or when you
+  want delivery done before moving on:
+
+      ForgeOpsTracker.capture_exception(error, __STACKTRACE__)
+      ForgeOpsTracker.flush(2_000)
+  """
+  @spec flush(timeout()) :: :ok | {:error, :timeout}
+  def flush(timeout \\ DeliveryQueue.drain_timeout()), do: DeliveryQueue.flush(timeout)
+
+  @doc """
+  Records one change to your system (a feature flag flipped, a config edit, a migration run) so
+  ForgeOps can show it next to the errors and slowdowns that followed. Queued like an error report,
+  so it never blocks the caller, and never raises; a no-op when the client isn't enabled.
+
+      ForgeOpsTracker.record_change(:feature_flag, "Enabled new checkout",
+        details: %{flag: "new_checkout", rollout: 25},
+        actor: "alice@example.com"
+      )
+
+  `kind` is one of `:feature_flag`, `:config`, `:migration`, `:dependency`, `:infrastructure`,
+  `:other` (atom or string; anything else is sent as `"other"`). `title` is cut to 200 characters.
+  Options: `:details` (a small map), `:environment` (defaults to the configured one), `:service`,
+  `:actor`, `:url`, `:id` (an idempotency key), `:occurred_at` (a `DateTime` or ISO 8601 string;
+  defaults to now).
+
+  Separately, `init/1` sends a change snapshot once per VM (runtime, loaded application versions,
+  and, with `track_env_var_names: true`, environment variable names but never values), and
+  ForgeOps records what changed since the last one. Turn that off with `detect_changes: false`.
+  """
+  @spec record_change(atom() | String.t(), String.t(), keyword()) :: :ok
+  def record_change(kind, title, opts \\ []), do: Changes.record(kind, title, opts)
+
+  @doc """
   Times `fun` as a child span of whatever span is open in this process (or of the request's root),
   returning its result. Outside a trace it just runs `fun`. Recorded even if `fun` raises, and the
   error propagates unchanged. `kind` is one of `"controller"`, `"service"`, `"database"`,
   `"redis"`, `"http"`, `"job"`, `"other"` (anything else is sent as `"other"`).
 
       order = ForgeOpsTracker.span("charge card", "service", %{order_id: id}, fn -> charge(id) end)
+
+  A `"database"` span can carry its SQL with `span/5`; see there.
   """
   @spec span(String.t(), String.t(), map(), (-> result)) :: result when result: var
   def span(name, kind \\ "service", data \\ %{}, fun), do: Tracing.span(name, kind, data, fun)
+
+  @doc """
+  `span/4` with options. For a `"database"` span, `:statement` (the SQL) and `:db_system` (e.g.
+  `"postgresql"`) add `"db.statement"`, with every string and number replaced by `?`, and
+  `"db.system"` to the span's data. The unmasked statement is never sent:
+
+      sql = "SELECT id, total FROM orders WHERE customer_id = $1 AND status = 'paid'"
+
+      rows =
+        ForgeOpsTracker.span("Load orders", "database", %{}, [statement: sql, db_system: "postgresql"], fn ->
+          Repo.query!(sql, [customer_id]).rows
+        end)
+
+  Other options, and these two on any other kind, are ignored.
+  """
+  @spec span(String.t(), String.t(), map(), keyword(), (-> result)) :: result when result: var
+  def span(name, kind, data, opts, fun) when is_list(opts),
+    do: Tracing.span(name, kind, database_data(kind, data, opts), fun)
 
   @doc """
   Records a span you timed yourself under the current one; a no-op outside a trace. `started_at`
@@ -254,17 +344,122 @@ defmodule ForgeOpsTracker do
   def record_span(name, kind, started_at, duration_ms, data \\ %{}),
     do: Tracing.record_span(name, kind, started_at, duration_ms, data)
 
+  @doc "`record_span/5` with the same `:statement` and `:db_system` options as `span/5`."
+  @spec record_span(String.t(), String.t(), DateTime.t(), number(), map(), keyword()) :: :ok
+  def record_span(name, kind, started_at, duration_ms, data, opts) when is_list(opts),
+    do: Tracing.record_span(name, kind, started_at, duration_ms, database_data(kind, data, opts))
+
+  defp database_data("database", data, opts) do
+    statement = Keyword.get(opts, :statement)
+    db_system = Keyword.get(opts, :db_system)
+
+    if statement || db_system,
+      do: QueryPlans.span_data(QueryPlans.mask_for_span(statement, db_system), db_system, data),
+      else: data
+  end
+
+  defp database_data(_kind, data, _opts), do: data
+
+  @doc false
+  # Called by the Ecto integration for each query it timed: records a "database" span (inside a
+  # trace) carrying "db.statement", the statement with every string and number masked to "?", and
+  # "db.system", then offers the query to the opt-in EXPLAIN (see ForgeOpsTracker.QueryPlanner).
+  # explain, when given, is a zero-arity function that runs EXPLAIN on a separate connection; it's
+  # only ever called by the planner's own Task. Never raises.
+  @spec record_database_query(
+          String.t(),
+          DateTime.t(),
+          number(),
+          String.t() | nil,
+          String.t() | nil,
+          (-> term()) | nil
+        ) :: :ok
+  def record_database_query(name, started_at, duration_ms, statement, db_system, explain \\ nil) do
+    masked =
+      if Tracing.active?() do
+        masked = QueryPlans.mask_for_span(statement, db_system)
+
+        Tracing.record_span(
+          name,
+          "database",
+          started_at,
+          duration_ms,
+          QueryPlans.span_data(masked, db_system)
+        )
+
+        masked
+      end
+
+    if explain && is_binary(statement),
+      do: QueryPlanner.consider(statement, db_system, duration_ms, explain, masked)
+
+    :ok
+  rescue
+    e ->
+      Configuration.log(
+        Configuration.get(),
+        "[forge_ops_tracker] database span failed: #{Exception.message(e)}"
+      )
+
+      :ok
+  end
+
+  @doc """
+  Makes one outgoing HTTP call inside the calling process's trace: records it as an `"http"` span
+  named `"<METHOD> <host>"` (never the path or query) and calls `fun` with the headers to add to
+  the request, a list of `{name, value}` tuples holding a W3C `traceparent` whose parent id is that
+  span's own id, so the called service's root span nests under it. Returns what `fun` returns; the
+  span is recorded even if `fun` raises, which propagates unchanged.
+
+      ForgeOpsTracker.http_span("POST", url, fn headers ->
+        Req.post!(url, json: order, headers: headers)
+      end)
+
+  The headers are `[]` outside a trace, when `propagate_traces` is off, or when the host isn't in
+  `trace_propagation_targets`; outside a trace no span is recorded either. With `track_tracing`
+  off the header is still handed over (the trace id links errors across services) but no span is
+  kept.
+  """
+  @spec http_span(String.t() | atom(), String.t() | URI.t(), map(), (Tracing.headers() -> result)) ::
+          result
+        when result: var
+  def http_span(method, url, data \\ %{}, fun), do: Tracing.http_span(method, url, data, fun)
+
+  @doc """
+  The calling process's current W3C trace id (32 lowercase hex characters), or `nil` outside a
+  trace. Handy for your own logs: it's the id ForgeOps links errors across services with.
+  """
+  @spec current_trace_id() :: String.t() | nil
+  def current_trace_id, do: Tracing.current_trace_id()
+
+  @doc """
+  Names the calling process's current request: `transaction_name` is the same name its
+  performance sample and root span use, `endpoint` the HTTP method plus the route pattern
+  (`"GET /users/:id"`), never the literal path. `ForgeOpsTracker.Integrations.Phoenix` does this
+  as soon as the router has matched the route; a no-op outside a trace.
+  """
+  @spec set_request_route(String.t() | nil, String.t() | nil) :: :ok
+  def set_request_route(transaction_name, endpoint),
+    do: Tracing.set_request_route(transaction_name, endpoint)
+
   @doc """
   Starts a trace on the calling process. `ForgeOpsTracker.Integrations.Phoenix`/`Oban` do this
   automatically; call it yourself (with `finish_trace/4`) to trace anything else, e.g. a GenServer
-  handling a message.
+  handling a message. Pass a W3C `traceparent` header value (a job carrying the header it was
+  enqueued with, say) to continue that trace: same trace id, and the root span's parent is the
+  caller's span; a missing or malformed value starts a new trace.
+
+  A trace id exists whenever the client is enabled, even with `track_tracing` off, since errors
+  captured inside the trace carry it and `http_span/4` propagates it; only span recording is
+  gated on `track_tracing`.
   """
-  @spec start_trace() :: :ok
-  def start_trace, do: Tracing.start_trace()
+  @spec start_trace(String.t() | nil) :: :ok
+  def start_trace(traceparent \\ nil), do: Tracing.start_trace(traceparent)
 
   @doc """
   Ends the calling process's trace, sending it when the root took at least
-  `trace_capture_threshold` milliseconds. `started_at` is a `DateTime`, `duration_ms` a number.
+  `trace_capture_threshold` milliseconds or an error was captured inside it. `started_at` is a
+  `DateTime`, `duration_ms` a number.
   """
   @spec finish_trace(String.t(), String.t(), DateTime.t(), number()) :: :ok
   def finish_trace(name, kind \\ "controller", started_at, duration_ms),
@@ -278,11 +473,15 @@ defmodule ForgeOpsTracker do
   def reset_for_testing do
     :logger.remove_handler(@handler_id)
     Configuration.update(fn _config -> %Configuration{} end)
+    Configuration.reset_warning_for_testing()
     Process.delete(@current_user_key)
     BreadcrumbBuffer.clear()
     Process.delete(:forge_ops_tracker_trace)
+    Process.delete(:forge_ops_tracker_request)
+    Process.delete(:forge_ops_tracker_escaped)
     MetricBuffer.clear(:custom)
     MetricBuffer.clear(:infrastructure)
+    QueryPlanner.reset_for_testing()
     :ok
   end
 end

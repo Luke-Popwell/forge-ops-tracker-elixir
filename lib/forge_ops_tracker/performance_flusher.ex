@@ -22,7 +22,7 @@ defmodule ForgeOpsTracker.PerformanceFlusher do
 
   use GenServer
 
-  alias ForgeOpsTracker.{Client, Configuration, HistogramBucketer}
+  alias ForgeOpsTracker.{Client, Configuration, DeliveryStatus, HistogramBucketer}
 
   @type bucket :: %{
           count: non_neg_integer(),
@@ -57,7 +57,7 @@ defmodule ForgeOpsTracker.PerformanceFlusher do
   def init(:ok) do
     Process.flag(:trap_exit, true)
     schedule_flush()
-    {:ok, %{buckets: %{}, period_started_at: DateTime.utc_now()}}
+    {:ok, %{buckets: %{}, period_started_at: DateTime.utc_now(), failed_flushes: 0}}
   end
 
   @impl true
@@ -119,7 +119,13 @@ defmodule ForgeOpsTracker.PerformanceFlusher do
   # (there, under a real concurrent-access mutex, "grows" is a merge; here it's simply a no-op),
   # and the same reason Api::V1::PerformanceSamplesController accepts a batch rather than a single
   # row: a failed flush shouldn't have to re-deliver by transaction one at a time.
-  defp do_flush(%{buckets: buckets} = state) when map_size(buckets) == 0, do: state
+  #
+  # That only holds for a delivery that failed for now, and only DeliveryStatus.max_failed_flushes/0
+  # times in a row: a batch the server rejected, or one that keeps failing, is let go of exactly the
+  # way a delivered one is, since re-sending it could never succeed. `failed_flushes` counts the
+  # streak, and nothing left to send ends it.
+  defp do_flush(%{buckets: buckets} = state) when map_size(buckets) == 0,
+    do: %{state | failed_flushes: 0}
 
   defp do_flush(state) do
     config = Configuration.get()
@@ -128,15 +134,24 @@ defmodule ForgeOpsTracker.PerformanceFlusher do
     samples =
       Enum.map(state.buckets, &to_sample(&1, config, state.period_started_at, period_ended_at))
 
-    if deliver(config, samples) do
-      %{buckets: %{}, period_started_at: DateTime.utc_now()}
-    else
-      state
+    case DeliveryStatus.settle(deliver(config, samples), state.failed_flushes) do
+      {:keep, failed_flushes} ->
+        %{state | failed_flushes: failed_flushes}
+
+      {:release, why} ->
+        if why do
+          Configuration.log(
+            config,
+            "[forge_ops_tracker] dropping #{length(samples)} buffered performance samples: #{why}"
+          )
+        end
+
+        %{state | buckets: %{}, period_started_at: DateTime.utc_now(), failed_flushes: 0}
     end
   end
 
   defp deliver(config, samples) do
-    Client.deliver_performance_samples(config, samples)
+    Client.attempt_performance_samples(config, samples)
   rescue
     e ->
       Configuration.log(
@@ -144,7 +159,7 @@ defmodule ForgeOpsTracker.PerformanceFlusher do
         "[forge_ops_tracker] performance flush error: #{Exception.format(:error, e, __STACKTRACE__)}"
       )
 
-      false
+      :failed
   end
 
   defp to_sample({{transaction_name, kind}, bucket}, config, period_started_at, period_ended_at) do

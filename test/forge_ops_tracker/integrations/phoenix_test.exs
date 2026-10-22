@@ -7,6 +7,12 @@ defmodule ForgeOpsTracker.Integrations.PhoenixTest do
   alias ForgeOpsTracker.Integrations.Phoenix, as: PhoenixIntegration
 
   setup do
+    # Start from empty buckets: PerformanceFlusher is shared by every test module, and the ones
+    # that drive an integration for another purpose (TracingTest, TraceContextTest) leave their
+    # timings in it, some under the very keys asserted on here. Which module ran last depends
+    # on the seed, so cleaning up only after each test here was never enough.
+    :sys.replace_state(ForgeOpsTracker.PerformanceFlusher, &%{&1 | buckets: %{}})
+
     on_exit(fn ->
       Configuration.update(fn _ -> %Configuration{} end)
       :sys.replace_state(ForgeOpsTracker.PerformanceFlusher, &%{&1 | buckets: %{}})

@@ -7,6 +7,12 @@ defmodule ForgeOpsTracker.PerformanceFlusherTest do
   alias ForgeOpsTracker.{Configuration, PerformanceFlusher, TestHttpServer}
 
   setup do
+    # Start from empty buckets: an earlier test's timings (an integration test whose delivery
+    # failed keeps its buckets for the next flush) would otherwise land in this test's request.
+    {drain_port, _} = TestHttpServer.start(202)
+    point_configuration_at(drain_port)
+    PerformanceFlusher.flush()
+
     on_exit(fn -> Configuration.update(fn _ -> %Configuration{} end) end)
     :ok
   end
@@ -74,6 +80,92 @@ defmodule ForgeOpsTracker.PerformanceFlusherTest do
     PerformanceFlusher.record("GET /flaky", "controller", 7.0)
     assert PerformanceFlusher.flush() == :ok
 
+    assert :sys.get_state(PerformanceFlusher).buckets != %{}
+  end
+
+  defp request_counts(requests) do
+    for request <- Agent.get(requests, & &1) do
+      request.body |> JSON.decode!() |> Map.fetch!("samples") |> Enum.map(& &1["request_count"])
+    end
+  end
+
+  defp dropped_messages do
+    receive do
+      {:logged, "[forge_ops_tracker] dropping" <> _ = message} -> [message | dropped_messages()]
+      {:logged, _other} -> dropped_messages()
+    after
+      0 -> []
+    end
+  end
+
+  defp log_to(test_pid) do
+    Configuration.update(fn config ->
+      %{config | logger: fn message -> send(test_pid, {:logged, message}) end}
+    end)
+  end
+
+  test "drops a batch the server rejected instead of sending it again" do
+    {port, requests} = TestHttpServer.start(422)
+    point_configuration_at(port)
+    log_to(self())
+
+    PerformanceFlusher.record("GET /refused", "controller", 7.0)
+    assert PerformanceFlusher.flush() == :ok
+    assert :sys.get_state(PerformanceFlusher).buckets == %{}
+
+    assert PerformanceFlusher.flush() == :ok
+    PerformanceFlusher.record("GET /refused", "controller", 7.0)
+    assert PerformanceFlusher.flush() == :ok
+
+    # One request each time, never the first one's count carried into the second.
+    assert request_counts(requests) == [[1], [1]]
+
+    assert dropped_messages() == [
+             "[forge_ops_tracker] dropping 1 buffered performance samples: the server rejected them and will not accept a retry",
+             "[forge_ops_tracker] dropping 1 buffered performance samples: the server rejected them and will not accept a retry"
+           ]
+  end
+
+  test "keeps a batch through four failed flushes and drops it on the fifth" do
+    {port, requests} = TestHttpServer.start(503)
+    point_configuration_at(port)
+    log_to(self())
+
+    PerformanceFlusher.record("GET /flaky", "controller", 7.0)
+    for _ <- 1..4, do: assert(PerformanceFlusher.flush() == :ok)
+    assert :sys.get_state(PerformanceFlusher).buckets != %{}
+    assert dropped_messages() == []
+
+    assert PerformanceFlusher.flush() == :ok
+    assert :sys.get_state(PerformanceFlusher).buckets == %{}
+    assert PerformanceFlusher.flush() == :ok
+
+    assert request_counts(requests) == List.duplicate([1], 5)
+
+    assert dropped_messages() == [
+             "[forge_ops_tracker] dropping 1 buffered performance samples: 5 flushes in a row failed"
+           ]
+  end
+
+  test "a flush that gets through starts the count of failed flushes again" do
+    on_exit(fn -> :sys.replace_state(PerformanceFlusher, &%{&1 | buckets: %{}}) end)
+
+    {failing_port, _} = TestHttpServer.start(500)
+    point_configuration_at(failing_port)
+    PerformanceFlusher.record("GET /flaky", "controller", 7.0)
+    for _ <- 1..4, do: assert(PerformanceFlusher.flush() == :ok)
+
+    {port, requests} = TestHttpServer.start(202)
+    point_configuration_at(port)
+    assert PerformanceFlusher.flush() == :ok
+    assert request_counts(requests) == [[1]]
+
+    {failing_port, _} = TestHttpServer.start(500)
+    point_configuration_at(failing_port)
+    PerformanceFlusher.record("GET /flaky", "controller", 7.0)
+    for _ <- 1..4, do: assert(PerformanceFlusher.flush() == :ok)
+
+    # Four failures since the flush that got through, so the bucket is still held, not dropped.
     assert :sys.get_state(PerformanceFlusher).buckets != %{}
   end
 

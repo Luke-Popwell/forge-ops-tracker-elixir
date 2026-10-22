@@ -211,7 +211,9 @@ defmodule ForgeOpsTracker.EventBuilderTest do
       dir =
         Path.join(
           System.tmp_dir!(),
-          "forge_ops_tracker_test_#{System.unique_integer([:positive])}"
+          # The OS pid too: unique_integer starts over in every test run, so without it a run can
+          # land on a directory an earlier, interrupted run left behind (a FIFO already there).
+          "forge_ops_tracker_test_#{System.pid()}_#{System.unique_integer([:positive])}"
         )
 
       File.mkdir_p!(dir)

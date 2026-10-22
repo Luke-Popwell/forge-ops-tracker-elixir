@@ -8,12 +8,19 @@ defmodule ForgeOpsTracker.Application do
     children = [
       ForgeOpsTracker.Configuration,
       ForgeOpsTracker.DeliveryQueue,
+      ForgeOpsTracker.QueryPlanner,
       ForgeOpsTracker.PerformanceFlusher,
       {ForgeOpsTracker.MetricBuffer, :custom},
       {ForgeOpsTracker.MetricBuffer, :infrastructure}
     ]
 
     opts = [strategy: :one_for_one, name: ForgeOpsTracker.Supervisor]
-    Supervisor.start_link(children, opts)
+    result = Supervisor.start_link(children, opts)
+
+    # Configured entirely through config.exs or FORGE_OPS_DSN (no init/1 call): send the change
+    # snapshot now. A no-op when disabled, and init/1 won't send a second one.
+    ForgeOpsTracker.Changes.maybe_send_snapshot()
+
+    result
   end
 end

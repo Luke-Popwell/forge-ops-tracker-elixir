@@ -39,12 +39,20 @@ defmodule ForgeOpsTracker.LoggerHandler do
     # way it already is for a manually-rescued ForgeOpsTracker.capture_exception/4 call. Correct
     # specifically because :logger dispatches a crash report synchronously, in the crashing
     # process's own context (verified directly, not assumed: see this module's own moduledoc).
+    #
+    # The request context (trace id, transaction name, endpoint) comes from the same process
+    # dictionary: live if the crash happened mid-request, or, for a Phoenix request whose router
+    # already emitted :exception (which finishes the request's trace before the process crashes
+    # and this runs), the copy ForgeOpsTracker.Integrations.Phoenix remembered for that exception.
+    ForgeOpsTracker.Tracing.mark_errored()
+
     Reporter.report(
       reason,
       stacktrace,
       %{},
       ForgeOpsTracker.current_user(),
-      ForgeOpsTracker.current_breadcrumbs()
+      ForgeOpsTracker.current_breadcrumbs(),
+      ForgeOpsTracker.Tracing.error_fields(reason)
     )
   end
 

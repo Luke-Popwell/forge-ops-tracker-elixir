@@ -101,6 +101,97 @@ defmodule ForgeOpsTracker.MetricBufferTest do
     assert length(Agent.get(requests, & &1)) == 1
   end
 
+  defp logging_to(test_pid), do: %{logger: fn message -> send(test_pid, {:logged, message}) end}
+
+  defp dropped_messages do
+    receive do
+      {:logged, "[forge_ops_tracker] dropping" <> _ = message} -> [message | dropped_messages()]
+      {:logged, _other} -> dropped_messages()
+    after
+      0 -> []
+    end
+  end
+
+  defp metric_names(requests) do
+    for request <- Agent.get(requests, & &1) do
+      request.body |> JSON.decode!() |> Map.fetch!("metrics") |> Enum.map(& &1["metric_name"])
+    end
+  end
+
+  test "a batch the server rejected is dropped and never sent again" do
+    {port, requests} = TestHttpServer.start(403)
+    configure(port, logging_to(self()))
+
+    ForgeOpsTracker.capture_metric("a")
+    ForgeOpsTracker.flush_metrics()
+    assert MetricBuffer.entries(:custom) == []
+
+    ForgeOpsTracker.flush_metrics()
+    ForgeOpsTracker.capture_metric("b")
+    ForgeOpsTracker.flush_metrics()
+
+    assert metric_names(requests) == [["a"], ["b"]]
+
+    assert dropped_messages() == [
+             "[forge_ops_tracker] dropping 1 buffered metrics: the server rejected them and will not accept a retry",
+             "[forge_ops_tracker] dropping 1 buffered metrics: the server rejected them and will not accept a retry"
+           ]
+  end
+
+  test "a batch is kept through four failed flushes and dropped on the fifth" do
+    {port, requests} = TestHttpServer.start(503)
+    configure(port, logging_to(self()))
+
+    ForgeOpsTracker.capture_metric("a")
+    for _ <- 1..4, do: ForgeOpsTracker.flush_metrics()
+    assert length(MetricBuffer.entries(:custom)) == 1
+    assert dropped_messages() == []
+
+    ForgeOpsTracker.flush_metrics()
+    assert MetricBuffer.entries(:custom) == []
+    ForgeOpsTracker.flush_metrics()
+
+    assert metric_names(requests) == List.duplicate(["a"], 5)
+
+    assert dropped_messages() == [
+             "[forge_ops_tracker] dropping 1 buffered metrics: 5 flushes in a row failed"
+           ]
+  end
+
+  test "a network failure counts as a failed flush like a 5xx does" do
+    {:ok, probe} = :gen_tcp.listen(0, [:binary])
+    {:ok, closed_port} = :inet.port(probe)
+    :gen_tcp.close(probe)
+    configure(closed_port, %{timeout: 500})
+
+    ForgeOpsTracker.capture_infrastructure_metric("cpu", 0.5)
+    for _ <- 1..4, do: ForgeOpsTracker.flush_metrics()
+    assert length(MetricBuffer.entries(:infrastructure)) == 1
+
+    ForgeOpsTracker.flush_metrics()
+    assert MetricBuffer.entries(:infrastructure) == []
+  end
+
+  test "a flush that gets through starts the count of failed flushes again" do
+    {failing_port, _} = TestHttpServer.start(500)
+    configure(failing_port)
+    ForgeOpsTracker.capture_metric("a")
+    for _ <- 1..4, do: ForgeOpsTracker.flush_metrics()
+
+    {port, requests} = TestHttpServer.start(202)
+    configure(port)
+    ForgeOpsTracker.flush_metrics()
+    assert metric_names(requests) == [["a"]]
+
+    {failing_port, _} = TestHttpServer.start(500)
+    configure(failing_port)
+    ForgeOpsTracker.capture_metric("b")
+    for _ <- 1..4, do: ForgeOpsTracker.flush_metrics()
+
+    # Four failures since the flush that got through, so "b" is still held, not dropped.
+    assert Enum.map(MetricBuffer.entries(:custom), & &1.metric_name) == ["b"]
+  end
+
   test "the buffer is capped and drops further entries until a flush succeeds" do
     configure()
     for _ <- 1..(MetricBuffer.max_entries() + 50), do: ForgeOpsTracker.capture_metric("m")

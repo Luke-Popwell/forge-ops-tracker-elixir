@@ -27,7 +27,21 @@ defmodule ForgeOpsTracker.Integrations.Phoenix do
   `:exception`), the root span named like the transaction above, so a slow request's own breakdown
   reaches `/spans` (see `ForgeOpsTracker.span/4`). `ForgeOpsTracker.Integrations.Ecto` adds a
   `"database"` span per query into it. Outbound HTTP is not instrumented (each HTTP client library
-  has its own telemetry events): wrap a call in `ForgeOpsTracker.span/4`.
+  has its own telemetry events): wrap a call in `ForgeOpsTracker.http_span/4`, which also hands it
+  the `traceparent` header to send.
+
+  The trace continues the caller's when the request arrived with a usable W3C `traceparent` header
+  (see `ForgeOpsTracker.TraceParent`), and its trace id exists even with `track_tracing` off, since
+  every error reported during the request carries it. `:start` fires once the router has matched
+  the route, before the pipeline and controller run, so the request is named there
+  (`transaction_name` and `endpoint`, both `"GET /users/:id"`): an error captured from inside the
+  controller already carries both.
+
+  A request that raises emits `:exception` before its process crashes, and the crash is only
+  reported afterward, by `ForgeOpsTracker.LoggerHandler`, once this has already finished (and
+  cleared) the request's trace. So `:exception` first remembers the request's context for that
+  exception (`ForgeOpsTracker.Tracing.snapshot_escaped/1`), which the crash report then picks up,
+  and marks the request errored, so its trace is sent however fast it was.
   """
 
   @doc "Registers the telemetry handler. Safe to call more than once: a later call is a no-op."
@@ -49,11 +63,14 @@ defmodule ForgeOpsTracker.Integrations.Phoenix do
   end
 
   @doc false
-  def handle_event([:phoenix, :router_dispatch, :start], _measurements, _metadata, _config) do
-    ForgeOpsTracker.start_trace()
+  def handle_event([:phoenix, :router_dispatch, :start], _measurements, metadata, _config) do
+    ForgeOpsTracker.start_trace(traceparent(metadata.conn))
+    name = "#{metadata.conn.method} #{metadata.route}"
+    ForgeOpsTracker.set_request_route(name, name)
   end
 
   def handle_event([:phoenix, :router_dispatch, :exception], measurements, metadata, _config) do
+    ForgeOpsTracker.Tracing.snapshot_escaped(Map.get(metadata, :reason))
     finish_trace(measurements, metadata)
   end
 
@@ -71,6 +88,15 @@ defmodule ForgeOpsTracker.Integrations.Phoenix do
       status: status,
       path: metadata.conn.request_path
     })
+  end
+
+  # A plain keyword lookup rather than Plug.Conn.get_req_header/2: Plug is an optional dependency
+  # of this SDK, and req_headers is a plain list of lowercase {name, value} pairs.
+  defp traceparent(conn) do
+    case List.keyfind(Map.get(conn, :req_headers, []), ForgeOpsTracker.TraceParent.header(), 0) do
+      {_name, value} -> value
+      nil -> nil
+    end
   end
 
   defp finish_trace(measurements, metadata) do

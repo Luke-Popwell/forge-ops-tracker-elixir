@@ -9,7 +9,7 @@ defmodule ForgeOpsTracker.EventBuilder do
   shape, not assumed from documentation alone.
   """
 
-  alias ForgeOpsTracker.{Configuration, PiiScrubber, SqlStatement}
+  alias ForgeOpsTracker.{Configuration, PiiScrubber, SqlStatement, StrictPrivacy}
 
   @max_frames 500
 
@@ -30,16 +30,31 @@ defmodule ForgeOpsTracker.EventBuilder do
   `reason` is whatever was raised/thrown: typically an `Exception` struct, but Elixir permits
   raising any term, so this doesn't require one. `stacktrace` is `__STACKTRACE__` as captured at
   the rescue/catch site. `context` is an arbitrary map of additional data to attach.
+
+  `request_fields` describes the request the error happened in (see
+  `ForgeOpsTracker.Tracing.error_fields/1`): `"transaction_name"` (the same `"GET /users/:id"` name
+  the request's root span and performance sample use), `"endpoint"` (the HTTP method plus the route
+  pattern), and `"trace_id"` (the request's 32-character lowercase hex W3C trace id, which is also
+  what links this error to errors other services reported for the same trace). Each key is only
+  present when known, and the map is empty outside a request.
   """
-  @spec build(Configuration.t(), term(), Exception.stacktrace(), map(), map() | nil, [map()]) ::
+  @spec build(
+          Configuration.t(),
+          term(),
+          Exception.stacktrace(),
+          map(),
+          map() | nil,
+          [map()],
           map()
+        ) :: map()
   def build(
         %Configuration{} = config,
         reason,
         stacktrace,
         context \\ %{},
         user \\ nil,
-        breadcrumbs \\ []
+        breadcrumbs \\ [],
+        request_fields \\ %{}
       ) do
     payload = %{
       "exception_class" => exception_class(reason),
@@ -62,9 +77,17 @@ defmodule ForgeOpsTracker.EventBuilder do
     payload =
       if breadcrumbs != [], do: Map.put(payload, "breadcrumbs", breadcrumbs), else: payload
 
+    payload =
+      Map.merge(payload, Map.take(request_fields, ["transaction_name", "endpoint", "trace_id"]))
+
     payload = attach_sql(payload, config, reason)
 
-    if config.scrub_pii, do: scrub(payload), else: payload
+    payload = if config.scrub_pii, do: scrub(payload), else: payload
+
+    # After scrubbing, so the fingerprint is of the message as it would otherwise have been sent.
+    if config.strict_privacy,
+      do: StrictPrivacy.event(payload, config.privacy_allowed_fields),
+      else: payload
   end
 
   # See SqlStatement for what's read off the error and how it's masked. The statement itself only
@@ -91,9 +114,10 @@ defmodule ForgeOpsTracker.EventBuilder do
   defp put_if(payload, true, key, value), do: Map.put(payload, key, value)
   defp put_if(payload, false, _key, _value), do: payload
 
-  # exception_class/occurred_at/environment/release/server_name/sdk_name/user are left alone:
-  # structured fields this client sets deliberately, not free text an exception or its context
-  # could accidentally spill sensitive data into. user specifically is a deliberate exemption,
+  # exception_class/occurred_at/environment/release/server_name/sdk_name/user/transaction_name/
+  # endpoint/trace_id are left alone: structured fields this client sets deliberately, not free
+  # text an exception or its context could accidentally spill sensitive data into (endpoint in
+  # particular is a declared route pattern, never the literal path). user specifically is a deliberate exemption,
   # not an oversight: PiiScrubber's own email pattern would otherwise redact the exact thing this
   # field exists to carry.
   defp scrub(payload) do
@@ -195,7 +219,8 @@ defmodule ForgeOpsTracker.EventBuilder do
   # in_app (never a third-party dependency: there'd be nothing meaningful to show, and it's not
   # the host app's own code to begin with), and configuration.capture_source_context has to be
   # true (see Configuration for why it defaults to true and why ForgeOps' own per-project
-  # setting, not this flag, is the durable, protected way to turn it off). Best-effort: any file
+  # setting, not this flag, is the durable, protected way to turn it off), with strict_privacy
+  # off. Best-effort: any file
   # that can't be read (deleted, permission denied, a path that only ever existed inside a build
   # step and isn't present in this deployment) just means this one frame gets no source context,
   # never a raised error of its own.
@@ -207,7 +232,7 @@ defmodule ForgeOpsTracker.EventBuilder do
   @doc false
   @spec attach_source_context(Configuration.t(), map()) :: map()
   def attach_source_context(
-        %Configuration{capture_source_context: true},
+        %Configuration{capture_source_context: true, strict_privacy: false},
         %{"in_app" => true} = frame
       ) do
     with file when is_binary(file) <- frame["file"],

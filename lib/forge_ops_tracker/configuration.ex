@@ -13,8 +13,13 @@ defmodule ForgeOpsTracker.Configuration do
 
   use GenServer
 
+  require Logger
+
+  @warned_key {__MODULE__, :disabled_environment_warned}
+
   defstruct dsn: nil,
-            environment: "development",
+            # See resolve_environment/3 for where the running app's value comes from.
+            environment: "production",
             release: nil,
             server_name: nil,
             app_module_prefix: nil,
@@ -57,9 +62,6 @@ defmodule ForgeOpsTracker.Configuration do
             # The most recent entries a single process's trail keeps; the oldest is dropped once
             # full. Matches gems/forge_ops_tracker's own default exactly.
             max_breadcrumbs: 30,
-            # Whether the Phoenix/Ecto/Oban integrations start a trace per request/job and report
-            # it (when slow) to /spans. ForgeOpsTracker.span/4 and record_span/5 only record inside
-            # a trace, so this gates the whole feature. On by default.
             # Milliseconds between flushes of the buffered capture_metric/3 and
             # capture_infrastructure_metric/3 entries (see ForgeOpsTracker.MetricBuffer). No
             # track_metrics flag the way track_performance has one: these are explicit calls the host
@@ -67,10 +69,59 @@ defmodule ForgeOpsTracker.Configuration do
             # that simply not calling them doesn't already do.
             metric_flush_interval: 60_000,
             infrastructure_metric_flush_interval: 60_000,
+            # Whether the Phoenix/Ecto/Oban integrations record spans per request/job and report
+            # them (when slow, or when the request errored) to /spans. ForgeOpsTracker.span/4 and
+            # record_span/5 only record inside a trace, so this gates span reporting. A request
+            # still gets a trace id with this off (see propagate_traces below). On by default.
             track_tracing: true,
             # Milliseconds, like every other duration in this struct: a trace is only sent when
-            # its root span took at least this long.
+            # its root span took at least this long, or the request errored.
             trace_capture_threshold: 1_000,
+            # Whether ForgeOpsTracker.http_span/4 hands its function a W3C `traceparent` header
+            # (https://www.w3.org/TR/trace-context/) for the outgoing request, so the service being
+            # called can continue this request's trace instead of starting its own. On by default,
+            # and independent of track_tracing: the header also carries the trace id that links an
+            # error here to an error there, which is useful with or without spans.
+            propagate_traces: true,
+            # Which hosts get that header: nil (the default) means every host. Otherwise a list
+            # where each entry is either a host string, matching that host and its subdomains on a
+            # dot boundary, ignoring case and a leading dot ("example.com" matches
+            # "api.example.com" but not "badexample.com"), or a Regex matched against the host.
+            # Useful for third-party APIs that reject unknown headers, or that shouldn't learn this
+            # app's trace ids at all.
+            trace_propagation_targets: nil,
+            # Whether init/1 sends one change snapshot per VM (runtime and loaded application
+            # versions, see ForgeOpsTracker.Changes) so ForgeOps can record what changed between
+            # deploys. On by default; record_change/3 works either way.
+            detect_changes: true,
+            # Whether that snapshot also lists environment variable names (never values), minus
+            # host-specific noise like HOSTNAME or PATH. Off by default.
+            track_env_var_names: false,
+            # Opt-in EXPLAIN for slow PostgreSQL reads (see ForgeOpsTracker.QueryPlanner). When on,
+            # a plain SELECT the Ecto integration timed at explain_threshold_ms or more gets an
+            # EXPLAIN (FORMAT JSON), never EXPLAIN ANALYZE, from a background Task on its own pooled
+            # connection, inside a READ ONLY transaction with a 2 second statement_timeout that is
+            # always rolled back. The masked statement and masked plan are sent; params never leave
+            # the VM. Rate limited to one EXPLAIN per distinct statement per 10 minutes and 10 per
+            # minute. Off by default because it does run extra (cheap, read-only) statements
+            # against your database.
+            explain_slow_queries: false,
+            # Milliseconds a query has to take before explain_slow_queries considers it.
+            explain_threshold_ms: 500,
+            # Send only structured facts about an error, never free text that could hold personal
+            # or health data: no message (a fingerprint of it instead, so errors still group), no
+            # breadcrumbs (none are recorded), endpoint, SQL statement or source context, only the
+            # user's id, and only the context and tag keys named in privacy_allowed_fields. Spans
+            # are named by method and host for outbound calls, raw paths cut to their first
+            # segment, and keep no data beyond the masked statement and database system. Off by
+            # default; FORGE_OPS_STRICT_PRIVACY=true or
+            # `config :forge_ops_tracker, strict_privacy: true` turns it on. See
+            # ForgeOpsTracker.StrictPrivacy.
+            strict_privacy: false,
+            # The context and tag keys strict privacy still sends, when their value is a string,
+            # number or boolean (your own error codes, say). Empty by default;
+            # FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature sets it.
+            privacy_allowed_fields: [],
             logger: nil
 
   @type t :: %__MODULE__{
@@ -94,6 +145,14 @@ defmodule ForgeOpsTracker.Configuration do
           infrastructure_metric_flush_interval: pos_integer(),
           track_tracing: boolean(),
           trace_capture_threshold: non_neg_integer(),
+          propagate_traces: boolean(),
+          trace_propagation_targets: [String.t() | Regex.t()] | nil,
+          detect_changes: boolean(),
+          track_env_var_names: boolean(),
+          explain_slow_queries: boolean(),
+          explain_threshold_ms: non_neg_integer(),
+          strict_privacy: boolean(),
+          privacy_allowed_fields: [String.t()],
           logger: (String.t() -> any()) | nil
         }
 
@@ -103,15 +162,128 @@ defmodule ForgeOpsTracker.Configuration do
   end
 
   defp initial_state do
+    {strict_privacy, privacy_allowed_fields} =
+      ForgeOpsTracker.StrictPrivacy.from_environment(System.get_env())
+
     %__MODULE__{
       dsn: env_or_nil("FORGE_OPS_DSN") || Application.get_env(:forge_ops_tracker, :dsn),
       environment:
-        env_or_nil("FORGE_OPS_ENVIRONMENT") ||
-          Application.get_env(:forge_ops_tracker, :environment, "development"),
+        resolve_environment(
+          System.get_env(),
+          Application.get_env(:forge_ops_tracker, :environment),
+          running_mix_env()
+        ),
       release:
         env_or_nil("FORGE_OPS_RELEASE") || Application.get_env(:forge_ops_tracker, :release),
-      server_name: safe_hostname()
+      server_name: safe_hostname(),
+      # The app's own config wins over the environment, as anything set in code does.
+      strict_privacy: Application.get_env(:forge_ops_tracker, :strict_privacy, strict_privacy),
+      privacy_allowed_fields:
+        Application.get_env(:forge_ops_tracker, :privacy_allowed_fields, privacy_allowed_fields)
     }
+  end
+
+  @doc """
+  The environment the client starts with, given the OS environment variables (`System.get_env/0`),
+  the app's `config :forge_ops_tracker, environment:` value, and `Mix.env/0` when this VM is running
+  under Mix (`nil` otherwise), in this order:
+
+    1. `FORGE_OPS_ENVIRONMENT`
+    2. `config :forge_ops_tracker, environment: ...`
+    3. `MIX_ENV`, with `prod` read as `"production"`, `dev` as `"development"` and `test` as
+       `"test"` (any other value as written)
+    4. `Mix.env/0`, mapped the same way: `mix` doesn't put its default `:dev` into `MIX_ENV`, so
+       this is what keeps `iex -S mix` or `mix phx.server` on a developer's machine from reporting
+       as production
+    5. `"production"`: a Mix release, an escript or an `elixir` script, where Mix isn't running and
+       nothing above is set, so an app deployed with nothing but a DSN still sends its errors.
+
+  An empty value counts as unset.
+  """
+  @spec resolve_environment(%{optional(String.t()) => String.t()}, term(), atom() | nil) ::
+          String.t()
+  def resolve_environment(os_env, app_environment, mix_env) do
+    present(Map.get(os_env, "FORGE_OPS_ENVIRONMENT")) ||
+      present(app_environment) ||
+      mix_environment(present(Map.get(os_env, "MIX_ENV"))) ||
+      mix_environment(present(mix_env)) ||
+      "production"
+  end
+
+  # Mix.env/0 only when Mix is actually running (mix run, iex -S mix, mix test, mix phx.server).
+  # Being loadable isn't enough: a plain `elixir` script can load the Mix module, but Mix.env/0
+  # raises there, since Mix's state only exists once the :mix application has started.
+  defp running_mix_env do
+    if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) and
+         List.keymember?(Application.started_applications(), :mix, 0) do
+      Mix.env()
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp present(value) when is_atom(value) and not is_nil(value) and not is_boolean(value),
+    do: present(Atom.to_string(value))
+
+  defp present(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp present(_value), do: nil
+
+  defp mix_environment(nil), do: nil
+  defp mix_environment("prod"), do: "production"
+  defp mix_environment("dev"), do: "development"
+  defp mix_environment(other), do: other
+
+  @doc """
+  The one-line warning `ForgeOpsTracker.init/1` logs when a DSN is configured but the environment
+  isn't one of `enabled_environments`, so nothing would be sent; `nil` when there's nothing to warn
+  about (no DSN, or the environment is enabled).
+  """
+  @spec disabled_environment_warning(t()) :: String.t() | nil
+  def disabled_environment_warning(%__MODULE__{} = config) do
+    if config.dsn in [nil, ""] or is_nil(api_key(config)) or
+         MapSet.member?(config.enabled_environments, config.environment) do
+      nil
+    else
+      enabled = Enum.join(config.enabled_environments, ", ")
+      verb = if MapSet.size(config.enabled_environments) == 1, do: "is", else: "are"
+
+      "[ForgeOps] Not sending: this environment is #{inspect(config.environment)}, and only " <>
+        "#{enabled} #{verb} enabled. Set FORGE_OPS_ENVIRONMENT=production (or add " <>
+        "#{inspect(config.environment)} to the enabled environments) to send from here."
+    end
+  end
+
+  @doc false
+  # Called by ForgeOpsTracker.init/1, and by Reporter.report when it drops an error: logs
+  # disabled_environment_warning/1 through Logger, at most once per VM, since a DSN with an
+  # environment that isn't enabled otherwise sends nothing, silently. No DSN, no warning: that's a
+  # deliberate "off".
+  @spec warn_if_not_sending(t()) :: :ok
+  def warn_if_not_sending(%__MODULE__{} = config) do
+    case disabled_environment_warning(config) do
+      nil ->
+        :ok
+
+      warning ->
+        unless :persistent_term.get(@warned_key, false) do
+          :persistent_term.put(@warned_key, true)
+          Logger.warning(warning)
+        end
+
+        :ok
+    end
+  end
+
+  @doc false
+  def reset_warning_for_testing do
+    :persistent_term.erase(@warned_key)
+    :ok
   end
 
   defp env_or_nil(name) do
@@ -214,11 +386,47 @@ defmodule ForgeOpsTracker.Configuration do
     end
   end
 
+  @doc "Same derivation again, swapping the trailing `/events` for `/changes`."
+  @spec changes_uri(t()) :: String.t() | nil
+  def changes_uri(%__MODULE__{} = config), do: swap_events_suffix(config, "/changes")
+
+  @doc "Same derivation again, swapping the trailing `/events` for `/change_snapshots`."
+  @spec change_snapshots_uri(t()) :: String.t() | nil
+  def change_snapshots_uri(%__MODULE__{} = config),
+    do: swap_events_suffix(config, "/change_snapshots")
+
+  @doc "Same derivation again, swapping the trailing `/events` for `/query_plans`."
+  @spec query_plans_uri(t()) :: String.t() | nil
+  def query_plans_uri(%__MODULE__{} = config), do: swap_events_suffix(config, "/query_plans")
+
   @spec enabled?(t()) :: boolean()
   def enabled?(%__MODULE__{} = config) do
     not is_nil(config.dsn) and config.dsn != "" and not is_nil(api_key(config)) and
       MapSet.member?(config.enabled_environments, config.environment)
   end
+
+  @doc """
+  Whether an outgoing request to `host` should carry a `traceparent` header; see
+  `propagate_traces`/`trace_propagation_targets` above. Case-insensitive, since hostnames are.
+  """
+  @spec propagate_trace?(t(), String.t() | nil) :: boolean()
+  def propagate_trace?(%__MODULE__{propagate_traces: false}, _host), do: false
+  def propagate_trace?(%__MODULE__{trace_propagation_targets: nil}, _host), do: true
+  def propagate_trace?(%__MODULE__{}, host) when host in [nil, ""], do: false
+
+  def propagate_trace?(%__MODULE__{trace_propagation_targets: targets}, host) do
+    host = String.downcase(host)
+    Enum.any?(List.wrap(targets), &target_matches?(&1, host))
+  end
+
+  defp target_matches?(%Regex{} = target, host), do: Regex.match?(target, host)
+
+  defp target_matches?(target, host) when is_binary(target) do
+    target = target |> String.downcase() |> String.trim_leading(".")
+    target != "" and (host == target or String.ends_with?(host, "." <> target))
+  end
+
+  defp target_matches?(_target, _host), do: false
 
   @spec log(t(), String.t()) :: :ok
   def log(%__MODULE__{logger: logger}, message) when is_function(logger, 1) do

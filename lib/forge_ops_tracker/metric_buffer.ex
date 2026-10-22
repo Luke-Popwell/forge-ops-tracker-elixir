@@ -15,24 +15,25 @@ defmodule ForgeOpsTracker.MetricBuffer do
   Ruby gem's `at_exit`, which is what lets a short-lived cron script that captures a few readings
   and ends still deliver them, given `Process.flag(:trap_exit, true)`). Delivery runs synchronously
   inside the server, so a `record` cast that arrives mid-delivery just waits in the mailbox and is
-  handled right after: nothing recorded during a delivery can be lost, and a failed delivery leaves
-  the entries in place for the next flush.
+  handled right after: nothing recorded during a delivery can be lost, and a delivery that failed
+  for now leaves the entries in place for the next flush. A batch the server rejected, or one that
+  failed `ForgeOpsTracker.DeliveryStatus.max_failed_flushes/0` flushes in a row, is dropped.
 
   Differences from the Ruby buffers: the buffer is capped at `max_entries/0` and drops further
-  entries once full (a plan without the feature answers 403 on every flush, and an uncapped buffer
-  would then grow for as long as the node lives), and a non-numeric value is dropped at record time
+  entries once full (an unreachable server fails every flush, and an uncapped buffer would keep
+  growing until the batch is given up on), and a non-numeric value is dropped at record time
   (the BEAM has no NaN or infinity to worry about, but a string would still be an invalid metric).
   """
 
   use GenServer
 
-  alias ForgeOpsTracker.{Client, Configuration}
+  alias ForgeOpsTracker.{Client, Configuration, DeliveryStatus}
 
   @max_entries 1000
 
   @type kind :: :custom | :infrastructure
 
-  @doc "The most entries one buffer holds; once full, further entries are dropped until a flush succeeds."
+  @doc "The most entries one buffer holds; once full, further entries are dropped until a flush lets go of them."
   @spec max_entries() :: pos_integer()
   def max_entries, do: @max_entries
 
@@ -74,7 +75,7 @@ defmodule ForgeOpsTracker.MetricBuffer do
   def init(kind) do
     Process.flag(:trap_exit, true)
     schedule_flush(kind)
-    {:ok, %{kind: kind, entries: [], count: 0}}
+    {:ok, %{kind: kind, entries: [], count: 0, failed_flushes: 0}}
   end
 
   @impl true
@@ -99,7 +100,9 @@ defmodule ForgeOpsTracker.MetricBuffer do
   @impl true
   def handle_call(:flush, _from, state), do: {:reply, :ok, do_flush(state)}
   def handle_call(:entries, _from, state), do: {:reply, Enum.reverse(state.entries), state}
-  def handle_call(:clear, _from, state), do: {:reply, :ok, %{state | entries: [], count: 0}}
+
+  def handle_call(:clear, _from, state),
+    do: {:reply, :ok, %{state | entries: [], count: 0, failed_flushes: 0}}
 
   @impl true
   def handle_info(:flush, %{kind: kind} = state) do
@@ -114,23 +117,34 @@ defmodule ForgeOpsTracker.MetricBuffer do
     :ok
   end
 
-  defp do_flush(%{entries: []} = state), do: state
+  # `failed_flushes` counts flushes in a row that failed for now; nothing left to send ends the streak.
+  defp do_flush(%{entries: []} = state), do: %{state | failed_flushes: 0}
 
-  defp do_flush(%{kind: kind, entries: entries} = state) do
+  defp do_flush(%{kind: kind, entries: entries, count: count} = state) do
     config = Configuration.get()
+    status = deliver(config, kind, Enum.reverse(entries))
 
-    if deliver(config, kind, Enum.reverse(entries)) do
-      %{state | entries: [], count: 0}
-    else
-      state
+    case DeliveryStatus.settle(status, state.failed_flushes) do
+      {:keep, failed_flushes} ->
+        %{state | failed_flushes: failed_flushes}
+
+      {:release, why} ->
+        if why do
+          Configuration.log(
+            config,
+            "[forge_ops_tracker] dropping #{count} buffered metrics: #{why}"
+          )
+        end
+
+        %{state | entries: [], count: 0, failed_flushes: 0}
     end
   end
 
   defp deliver(config, :custom, entries),
-    do: safely(config, fn -> Client.deliver_metrics(config, entries) end)
+    do: safely(config, fn -> Client.attempt_metrics(config, entries) end)
 
   defp deliver(config, :infrastructure, entries),
-    do: safely(config, fn -> Client.deliver_infrastructure_metrics(config, entries) end)
+    do: safely(config, fn -> Client.attempt_infrastructure_metrics(config, entries) end)
 
   defp safely(config, fun) do
     fun.()
@@ -141,7 +155,7 @@ defmodule ForgeOpsTracker.MetricBuffer do
         "[forge_ops_tracker] metric flush error: #{Exception.format(:error, e, __STACKTRACE__)}"
       )
 
-      false
+      :failed
   end
 
   defp schedule_flush(kind) do
