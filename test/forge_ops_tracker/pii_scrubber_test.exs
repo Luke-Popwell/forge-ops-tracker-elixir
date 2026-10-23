@@ -3,6 +3,32 @@ defmodule ForgeOpsTracker.PiiScrubberTest do
 
   alias ForgeOpsTracker.PiiScrubber
 
+  # test/fixtures/pii_scrubbing_vectors.json, a byte-identical copy of this repo's
+  # sdks/pii_scrubbing_vectors.json, generated from the server's own implementation.
+  @vectors Path.expand("../fixtures/pii_scrubbing_vectors.json", __DIR__)
+           |> File.read!()
+           |> JSON.decode!()
+
+  test "scrubs every shared card number and IBAN vector exactly as the server does" do
+    assert length(@vectors["strings"]) > 0
+
+    for vector <- @vectors["strings"] do
+      assert PiiScrubber.scrub_string(vector["input"]) == vector["scrubbed"],
+             "scrubbing #{inspect(vector["input"])}"
+    end
+  end
+
+  test "redacts every shared bank-detail key vector exactly as the server does" do
+    assert length(@vectors["keys"]) > 0
+
+    for vector <- @vectors["keys"] do
+      expected = if vector["redacted"], do: PiiScrubber.redacted(), else: "x"
+
+      assert PiiScrubber.scrub(%{vector["key"] => "x"}) == %{vector["key"] => expected},
+             "key #{inspect(vector["key"])}"
+    end
+  end
+
   test "redacts an email address embedded in free text" do
     assert PiiScrubber.scrub_string("contact user@example.com for help") ==
              "contact [EMAIL FILTERED] for help"
