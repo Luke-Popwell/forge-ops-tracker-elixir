@@ -86,7 +86,7 @@ defmodule ForgeOpsTracker.EventBuilder do
 
     # After scrubbing, so the fingerprint is of the message as it would otherwise have been sent.
     if config.strict_privacy,
-      do: StrictPrivacy.event(payload, config.privacy_allowed_fields),
+      do: StrictPrivacy.event(payload, config.privacy_allowed_fields, config.privacy_user_key),
       else: payload
   end
 

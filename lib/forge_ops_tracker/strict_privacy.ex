@@ -155,10 +155,11 @@ defmodule ForgeOpsTracker.StrictPrivacy do
   privacy sends: `"message"` is `""` and `"message_fingerprint"` is added; breadcrumbs, endpoint,
   SQL statement and source context are dropped; a raw-path `"transaction_name"` keeps only its first segment (see
   `transaction_name/1`); context and tags keep only `allowed_fields` keys
-  with plain values (left out when nothing is left); the user keeps only its id.
+  with plain values (left out when nothing is left); the user is only its id hashed with
+  `user_key` (see `hashed_user_id/2`), and is left out when there's no key or no id.
   """
-  @spec event(map(), [String.t()]) :: map()
-  def event(payload, allowed_fields) do
+  @spec event(map(), [String.t()], String.t() | nil) :: map()
+  def event(payload, allowed_fields, user_key \\ nil) do
     payload
     |> Map.drop(["breadcrumbs", "endpoint", "sql_statement"])
     |> put_or_drop("transaction_name", transaction_name(payload["transaction_name"]))
@@ -173,7 +174,23 @@ defmodule ForgeOpsTracker.StrictPrivacy do
     })
     |> put_or_drop("context", allowed(payload["context"], allowed_fields))
     |> put_or_drop("tags", allowed(payload["tags"], allowed_fields))
-    |> put_or_drop("user", user(payload["user"]))
+    |> put_or_drop("user", user(payload["user"], user_key))
+  end
+
+  @doc """
+  `"h1:"` and the first 32 lowercase hex characters of HMAC-SHA256 of the id's UTF-8 text, keyed
+  with the app's own secret (`privacy_user_key`), which ForgeOps never sees. The same id hashes the
+  same under one key, so affected customers can still be counted; a raw id can be a record number
+  that identifies a person, and an unkeyed hash of a small number can be guessed back.
+  """
+  @spec hashed_user_id(String.t() | number() | atom(), String.t()) :: String.t()
+  def hashed_user_id(id, key) do
+    digest =
+      :crypto.mac(:hmac, :sha256, to_string(key), to_string(id))
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, @fingerprint_length)
+
+    "h1:" <> digest
   end
 
   @doc """
@@ -188,9 +205,10 @@ defmodule ForgeOpsTracker.StrictPrivacy do
   end
 
   @doc false
-  # FORGE_OPS_STRICT_PRIVACY and FORGE_OPS_PRIVACY_ALLOWED_FIELDS out of `os_env`
-  # (System.get_env/0's shape), for Configuration's initial state.
-  @spec from_environment(%{optional(String.t()) => String.t()}) :: {boolean(), [String.t()]}
+  # FORGE_OPS_STRICT_PRIVACY, FORGE_OPS_PRIVACY_ALLOWED_FIELDS and FORGE_OPS_PRIVACY_USER_KEY out
+  # of `os_env` (System.get_env/0's shape), for Configuration's initial state. An empty key is nil.
+  @spec from_environment(%{optional(String.t()) => String.t()}) ::
+          {boolean(), [String.t()], String.t() | nil}
   def from_environment(os_env) do
     on = String.downcase(String.trim(Map.get(os_env, "FORGE_OPS_STRICT_PRIVACY", ""))) == "true"
 
@@ -201,7 +219,13 @@ defmodule ForgeOpsTracker.StrictPrivacy do
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
 
-    {on, fields}
+    user_key =
+      case Map.get(os_env, "FORGE_OPS_PRIVACY_USER_KEY") do
+        "" -> nil
+        key -> key
+      end
+
+    {on, fields, user_key}
   end
 
   defp put_or_drop(payload, key, nil), do: Map.delete(payload, key)
@@ -224,7 +248,10 @@ defmodule ForgeOpsTracker.StrictPrivacy do
 
   defp allowed(_fields, _allowed_fields), do: nil
 
-  defp user(user) when is_map(user) do
+  # Only a keyed hash of the user's id, and only with a key set; nil otherwise.
+  defp user(_user, key) when key in [nil, ""], do: nil
+
+  defp user(user, key) when is_map(user) do
     case Map.get(user, "id", Map.get(user, :id)) do
       nil ->
         nil
@@ -233,9 +260,9 @@ defmodule ForgeOpsTracker.StrictPrivacy do
         id =
           if is_binary(id) or is_number(id) or is_atom(id), do: to_string(id), else: inspect(id)
 
-        if String.trim(id) != "", do: %{"id" => id}
+        if String.trim(id) != "", do: %{"id" => hashed_user_id(id, key)}
     end
   end
 
-  defp user(_user), do: nil
+  defp user(_user, _key), do: nil
 end

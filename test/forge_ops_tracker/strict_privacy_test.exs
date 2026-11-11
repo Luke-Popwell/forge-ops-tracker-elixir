@@ -77,6 +77,20 @@ defmodule ForgeOpsTracker.StrictPrivacyTest do
     assert @vectors["fingerprint"] != []
   end
 
+  test "every user_id vector hashes exactly" do
+    for vector <- @vectors["user_id"] do
+      assert StrictPrivacy.hashed_user_id(vector["id"], vector["key"]) == vector["hashed"],
+             inspect(vector)
+    end
+
+    assert @vectors["user_id"] != []
+  end
+
+  test "an integer user id hashes as its text" do
+    assert StrictPrivacy.hashed_user_id(42, "customer-secret") ==
+             "h1:316d4a35bc95112698f59ef5aac5c29a"
+  end
+
   test "every span_name vector" do
     for vector <- @vectors["span_name"] do
       assert StrictPrivacy.span_name(vector["name"]) == vector["strict"], inspect(vector)
@@ -153,12 +167,18 @@ defmodule ForgeOpsTracker.StrictPrivacyTest do
   test "the options come from the environment" do
     assert StrictPrivacy.from_environment(%{
              "FORGE_OPS_STRICT_PRIVACY" => "true",
-             "FORGE_OPS_PRIVACY_ALLOWED_FIELDS" => "error_code, feature,,"
-           }) == {true, ["error_code", "feature"]}
+             "FORGE_OPS_PRIVACY_ALLOWED_FIELDS" => "error_code, feature,,",
+             "FORGE_OPS_PRIVACY_USER_KEY" => "customer-secret"
+           }) == {true, ["error_code", "feature"], "customer-secret"}
 
-    assert StrictPrivacy.from_environment(%{}) == {false, []}
+    assert StrictPrivacy.from_environment(%{}) == {false, [], nil}
+
+    assert StrictPrivacy.from_environment(%{"FORGE_OPS_PRIVACY_USER_KEY" => ""}) ==
+             {false, [], nil}
+
     assert %Configuration{}.strict_privacy == false
     assert %Configuration{}.privacy_allowed_fields == []
+    assert %Configuration{}.privacy_user_key == nil
   end
 
   test "a strict event carries no free text" do
@@ -177,7 +197,7 @@ defmodule ForgeOpsTracker.StrictPrivacyTest do
     end
 
     assert payload["context"] == %{"error_code" => "E42", "feature" => 7}
-    assert payload["user"] == %{"id" => "42"}
+    refute Map.has_key?(payload, "user")
     assert payload["sql_objects"] != nil
     assert payload["transaction_name"] == "GET /patients/:id"
     assert payload["trace_id"] == "abc"
@@ -191,12 +211,37 @@ defmodule ForgeOpsTracker.StrictPrivacyTest do
     end
   end
 
+  test "a strict event with a user key carries only the hashed user id" do
+    {_error, payload} = build(strict_configuration(%{privacy_user_key: "customer-secret"}))
+
+    assert payload["user"] == %{"id" => StrictPrivacy.hashed_user_id("42", "customer-secret")}
+    assert payload["user"]["id"] =~ ~r/\Ah1:[0-9a-f]{32}\z/
+  end
+
+  test "a strict event with no user key, or an empty one, carries no user" do
+    for key <- [nil, ""] do
+      {_error, payload} = build(strict_configuration(%{privacy_user_key: key}))
+      refute Map.has_key?(payload, "user"), inspect(key)
+    end
+  end
+
+  test "a strict event with a blank user id carries no user" do
+    payload =
+      StrictPrivacy.event(%{"message" => "boom", "user" => %{id: "  "}}, [], "customer-secret")
+
+    refute Map.has_key?(payload, "user")
+  end
+
   test "context, tags and user are left out when nothing is left" do
     {_error, payload} = build(strict_configuration(%{privacy_allowed_fields: []}))
     refute Map.has_key?(payload, "context")
     refute Map.has_key?(payload, "tags")
 
-    assert StrictPrivacy.event(%{"message" => "boom", "user" => %{email: "jane@example.com"}}, [])
+    assert StrictPrivacy.event(
+             %{"message" => "boom", "user" => %{email: "jane@example.com"}},
+             [],
+             "customer-secret"
+           )
            |> Map.has_key?("user") == false
   end
 

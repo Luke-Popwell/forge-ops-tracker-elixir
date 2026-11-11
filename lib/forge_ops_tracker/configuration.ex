@@ -110,8 +110,9 @@ defmodule ForgeOpsTracker.Configuration do
             explain_threshold_ms: 500,
             # Send only structured facts about an error, never free text that could hold personal
             # or health data: no message (a fingerprint of it instead, so errors still group), no
-            # breadcrumbs (none are recorded), endpoint, SQL statement or source context, only the
-            # user's id, and only the context and tag keys named in privacy_allowed_fields. Spans
+            # breadcrumbs (none are recorded), endpoint, SQL statement or source context, the
+            # user's id only as a keyed hash (privacy_user_key), and only the context and tag keys
+            # named in privacy_allowed_fields. Spans
             # are named by method and host for outbound calls, raw paths cut to their first
             # segment, and keep no data beyond the masked statement and database system. Off by
             # default; FORGE_OPS_STRICT_PRIVACY=true or
@@ -122,6 +123,12 @@ defmodule ForgeOpsTracker.Configuration do
             # number or boolean (your own error codes, say). Empty by default;
             # FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature sets it.
             privacy_allowed_fields: [],
+            # Strict privacy sends the user's id only as a keyed hash
+            # (ForgeOpsTracker.StrictPrivacy.hashed_user_id/2) with this secret, which stays in
+            # your app; unset, no user is sent at all. Keep it the same across deploys and servers,
+            # or the same customer counts as two. FORGE_OPS_PRIVACY_USER_KEY or
+            # `config :forge_ops_tracker, privacy_user_key: "..."` sets it; empty counts as unset.
+            privacy_user_key: nil,
             logger: nil
 
   @type t :: %__MODULE__{
@@ -153,6 +160,7 @@ defmodule ForgeOpsTracker.Configuration do
           explain_threshold_ms: non_neg_integer(),
           strict_privacy: boolean(),
           privacy_allowed_fields: [String.t()],
+          privacy_user_key: String.t() | nil,
           logger: (String.t() -> any()) | nil
         }
 
@@ -162,7 +170,7 @@ defmodule ForgeOpsTracker.Configuration do
   end
 
   defp initial_state do
-    {strict_privacy, privacy_allowed_fields} =
+    {strict_privacy, privacy_allowed_fields, privacy_user_key} =
       ForgeOpsTracker.StrictPrivacy.from_environment(System.get_env())
 
     %__MODULE__{
@@ -179,7 +187,12 @@ defmodule ForgeOpsTracker.Configuration do
       # The app's own config wins over the environment, as anything set in code does.
       strict_privacy: Application.get_env(:forge_ops_tracker, :strict_privacy, strict_privacy),
       privacy_allowed_fields:
-        Application.get_env(:forge_ops_tracker, :privacy_allowed_fields, privacy_allowed_fields)
+        Application.get_env(:forge_ops_tracker, :privacy_allowed_fields, privacy_allowed_fields),
+      privacy_user_key:
+        case Application.get_env(:forge_ops_tracker, :privacy_user_key, privacy_user_key) do
+          "" -> nil
+          key -> key
+        end
     }
   end
 

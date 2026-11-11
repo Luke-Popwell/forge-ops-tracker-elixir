@@ -12,7 +12,7 @@ supervision and logging primitives rather than anything bolted on from outside.
 ```elixir
 def deps do
   [
-    {:forge_ops_tracker, "~> 0.20.0"}
+    {:forge_ops_tracker, "~> 0.21.0"}
   ]
 end
 ```
@@ -246,11 +246,15 @@ For apps that can't let personal or health data (PII, PHI) leave their own serve
 privacy on, an error is sent as structured facts only, never free text a person could have typed:
 
 - no message: a `message_fingerprint` is sent instead, a one-way hash of the message (as PII
-  scrubbing leaves it) with its numbers, hex ids and UUIDs taken out, computed in this VM, so
+  scrubbing leaves it) with its emails, quoted values, numbers, hex ids and UUIDs taken out, computed in this VM, so
   errors still group by message;
 - no breadcrumbs (`add_breadcrumb/4` records nothing), no `endpoint`, no SQL statement
   (`sql_objects`, the table and procedure names, still go), and no source context;
-- the user's `id` only, never an email or username;
+- the user's `email` and `username` are never sent, and neither is the raw `id`. With
+  `privacy_user_key` set, the id is sent as a keyed hash (HMAC-SHA256 with your key, which never
+  leaves your app), so ForgeOps can still count affected customers but can't read the id. Without
+  a key, no user is sent at all. Keep the key the same across servers and deploys, or one customer
+  counts as two;
 - `context` and `tags` keep only the keys you list in `privacy_allowed_fields`, and only when the
   value is a string, number or boolean. Atom keys match too (`%{error_code: "E42"}` is kept when
   `"error_code"` is allowed).
@@ -272,12 +276,18 @@ when you allow it.
 config :forge_ops_tracker,
   strict_privacy: true,
   privacy_allowed_fields: ["error_code", "feature"]
+
+# config/runtime.exs
+config :forge_ops_tracker,
+  # default nil: no user sent
+  privacy_user_key: System.get_env("MY_FORGE_OPS_USER_KEY")
 ```
 
-or `ForgeOpsTracker.init(strict_privacy: true, privacy_allowed_fields: ["error_code"])`. Both are
-off and empty by default, and can be set from the environment instead:
-`FORGE_OPS_STRICT_PRIVACY=true` and `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature` (comma
-separated). A value set in `config.exs` or `init/1` wins over the environment.
+or `ForgeOpsTracker.init(strict_privacy: true, privacy_allowed_fields: ["error_code"])`. All three
+are off, empty and unset by default, and can be set from the environment instead:
+`FORGE_OPS_STRICT_PRIVACY=true`, `FORGE_OPS_PRIVACY_ALLOWED_FIELDS=error_code,feature` (comma
+separated) and `FORGE_OPS_PRIVACY_USER_KEY=...`. A value set in `config.exs` or `init/1` wins over
+the environment.
 
 ForgeOps applies the same rules again on arrival when the project's own Strict privacy setting is
 on, so an app with an older or misconfigured client still can't get text stored for that project.
